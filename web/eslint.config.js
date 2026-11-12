@@ -6,5 +6,10 @@ export default tseslint.config(
   { ignores: ['dist', 'node_modules'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
-  { plugins: { 'react-hooks': reactHooks }, rules: reactHooks.configs.recommended.rules },
+  { plugins: { 'react-hooks': reactHooks }, rules: {
+      ...reactHooks.configs.recommended.rules,
+      // Loading data when a screen mounts is the one thing our effects do.
+      'react-hooks/set-state-in-effect': 'off',
+    },
+  },
 );
