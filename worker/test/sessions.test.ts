@@ -59,32 +59,36 @@ test('auth state round-trips through the store with Buffers intact', async () =>
   assert.deepEqual(await second.state.keys.get('pre-key', ['1']), {});
 });
 
-test('QR, open and creds.update are written to wa_sessions / wa_auth', async () => {
+test('pairing code, open and creds.update are written to wa_sessions / wa_auth', async () => {
   const { store, sockets, manager } = setup();
-  await manager.start(USER);
+  await manager.start(USER, '15550009999');
   assert.equal(store.sessions.get(USER)?.status, 'connecting');
   const sock = sockets[0]!;
 
+  // Baileys offers a QR when it is ready to link; we ask for a code instead, once.
   sock.ev.emit('connection.update', { qr: 'QR-1' });
+  sock.ev.emit('connection.update', { qr: 'QR-2' });
   await tick();
-  assert.deepEqual([store.sessions.get(USER)?.status, store.sessions.get(USER)?.qr], ['qr', 'QR-1']);
+  assert.deepEqual(sock.pairingRequests, ['15550009999']);
+  assert.deepEqual([store.sessions.get(USER)?.status, store.sessions.get(USER)?.pairing_code], ['pairing', 'ABCD1234']);
 
   sock.ev.emit('creds.update', {});
   await tick();
   assert.ok(await store.hasAuth(USER));
 
+  sock.authState.creds.me = { id: 'paired' }; // the user typed the code
   sock.ev.emit('connection.update', { connection: 'open' });
   await tick();
   const s = store.sessions.get(USER)!;
-  assert.deepEqual([s.status, s.qr, s.phone], ['connected', null, '15550009999']);
+  assert.deepEqual([s.status, s.pairing_code, s.phone], ['connected', null, '15550009999']);
   assert.ok(s.last_connected_at);
   assert.equal(manager.count(), 1);
 
-  await manager.start(USER); // idempotent
+  await manager.start(USER, '15550001111'); // already linked: nothing happens
   assert.equal(sockets.length, 1);
 });
 
-test('a worker restart reconnects every active user with the stored login, no new QR', async () => {
+test('a worker restart reconnects every active user with the stored login, no new code', async () => {
   const { store, manager: before, sockets: s1 } = setup();
   store.addUser('lapsed', 'canceled');
   store.addUser('never-linked', 'active');
@@ -103,7 +107,10 @@ test('a worker restart reconnects every active user with the stored login, no ne
   });
   await after.bootAll();
   assert.equal(sockets.length, 1, 'only the subscribed user with a stored login');
-  assert.deepEqual(sockets[0]!.authState.creds.me, { id: '15550009999:3@s.whatsapp.net' }, 'same identity: no QR needed');
+  assert.deepEqual(sockets[0]!.authState.creds.me, { id: '15550009999:3@s.whatsapp.net' }, 'same identity: no pairing needed');
+  sockets[0]!.ev.emit('connection.update', { connection: 'open' });
+  await tick();
+  assert.deepEqual(sockets[0]!.pairingRequests, [], 'no code was requested');
   assert.ok(after.has(USER) && !after.has('lapsed') && !after.has('never-linked'));
 });
 
@@ -148,7 +155,7 @@ test('any other close reconnects with backoff 2s, 5s, 15s, 60s, 60s', async () =
   assert.equal(timers[5]!.ms, 2000);
 });
 
-test('the restart WhatsApp asks for right after a QR scan reconnects', async () => {
+test('the restart WhatsApp asks for right after pairing reconnects', async () => {
   const { sockets, timers, manager, close } = setup();
   await manager.start(USER);
   sockets[0]!.authState.creds.me = undefined;
@@ -157,16 +164,37 @@ test('the restart WhatsApp asks for right after a QR scan reconnects', async () 
   assert.equal(timers.length, 1);
 });
 
-test('an unscanned QR that times out stops quietly instead of looping', async () => {
+test('a code nobody enters times out and stops quietly instead of looping', async () => {
   const { store, sockets, timers, manager, close } = setup();
-  await manager.start(USER);
-  sockets[0]!.authState.creds.me = undefined;
+  await manager.start(USER, '15550009999');
   sockets[0]!.ev.emit('connection.update', { qr: 'QR-1' });
   await tick();
   close(sockets[0]!, DisconnectReason.timedOut);
   await tick();
   assert.equal(timers.length, 0);
-  assert.deepEqual([store.sessions.get(USER)?.status, store.sessions.get(USER)?.qr], ['disconnected', null]);
+  assert.deepEqual([store.sessions.get(USER)?.status, store.sessions.get(USER)?.pairing_code], ['disconnected', null]);
+  assert.equal(manager.has(USER), false);
+});
+
+test('pressing Connect again with a corrected number starts a fresh pairing', async () => {
+  const { sockets, manager } = setup();
+  await manager.start(USER, '15550000000');
+  sockets[0]!.ev.emit('connection.update', { qr: 'QR-1' });
+  await tick();
+  await manager.start(USER, '15550009999');
+  assert.ok(sockets[0]!.ended);
+  sockets[1]!.ev.emit('connection.update', { qr: 'QR-1' });
+  await tick();
+  assert.deepEqual(sockets[1]!.pairingRequests, ['15550009999']);
+});
+
+test('a stored login WhatsApp no longer accepts, with no number to pair, ends as logged_out', async () => {
+  const { store, sockets, manager } = setup();
+  await manager.start(USER);
+  sockets[0]!.ev.emit('connection.update', { qr: 'QR-1' });
+  await tick();
+  assert.deepEqual(sockets[0]!.pairingRequests, []);
+  assert.equal(store.sessions.get(USER)?.status, 'logged_out');
   assert.equal(manager.has(USER), false);
 });
 

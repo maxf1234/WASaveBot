@@ -48,7 +48,7 @@ function setup(trialDays = 7) {
   const calls: string[] = [];
   const sessions = {
     count: () => 3,
-    start: async (id: string) => void calls.push(`start:${id}`),
+    start: async (id: string, phone?: string) => void calls.push(`start:${id}${phone ? `:${phone}` : ''}`),
     stop: async (id: string) => void calls.push(`stop:${id}`),
     logout: async (id: string) => void calls.push(`logout:${id}`),
   };
@@ -68,8 +68,12 @@ function setup(trialDays = 7) {
   const server = app.listen(0);
   after(() => server.close());
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const post = (path: string, token?: string) =>
-    fetch(base + path, { method: 'POST', headers: token ? { authorization: `Bearer ${token}` } : {} });
+  const post = (path: string, token?: string, body?: object) =>
+    fetch(base + path, {
+      method: 'POST',
+      headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
   const webhook = (event: object, secret = SECRET) => {
     const payload = JSON.stringify(event);
     return fetch(`${base}/api/stripe/webhook`, {
@@ -108,15 +112,23 @@ test('every route except the webhook needs a valid JWT', async () => {
   assert.deepEqual(calls, []);
 });
 
-test('session start is 402 until subscribed, then starts the socket', async () => {
+test('session start is 402 until subscribed, then needs a phone number to pair', async () => {
   const { post, store, calls } = setup();
-  assert.equal((await post('/api/session/start', `good:${USER}`)).status, 402);
-  assert.deepEqual(calls, []);
+  assert.equal((await post('/api/session/start', `good:${USER}`, { phone: '+1 555 000 9999' })).status, 402);
   store.profiles.get(USER)!.subscription_status = 'trialing';
+  assert.equal((await post('/api/session/start', `good:${USER}`)).status, 400, 'no number, nothing stored');
+  assert.equal((await post('/api/session/start', `good:${USER}`, { phone: '12345' })).status, 400);
+  assert.deepEqual(calls, []);
+
+  assert.equal((await post('/api/session/start', `good:${USER}`, { phone: '+1 (555) 000-9999' })).status, 200);
+  assert.deepEqual(calls, [`start:${USER}:15550009999`]);
+
+  // With a stored login the number is optional.
+  await store.setAuth(USER, [['creds', { me: 1 }]]);
   assert.equal((await post('/api/session/start', `good:${USER}`)).status, 200);
-  assert.deepEqual(calls, [`start:${USER}`]);
+  assert.equal(calls.at(-1), `start:${USER}`);
   assert.equal((await post('/api/session/logout', `good:${USER}`)).status, 200);
-  assert.deepEqual(calls, [`start:${USER}`, `logout:${USER}`]);
+  assert.equal(calls.at(-1), `logout:${USER}`);
 });
 
 test('checkout creates the customer once, with the price and trial', async () => {

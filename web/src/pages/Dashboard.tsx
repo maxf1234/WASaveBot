@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { QRCodeSVG } from 'qrcode.react';
 import { Button, Card, inputClass, Notice, Switch } from '../components/ui';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
@@ -9,7 +8,7 @@ import type { SavedContact, WaSession } from '../lib/supabase';
 
 const STATUS: Record<WaSession['status'], { label: string; style: string }> = {
   connected: { label: 'Connected', style: 'bg-emerald-100 text-emerald-800' },
-  qr: { label: 'Scan the QR code', style: 'bg-amber-100 text-amber-800' },
+  pairing: { label: 'Enter the code', style: 'bg-amber-100 text-amber-800' },
   connecting: { label: 'Connecting…', style: 'bg-amber-100 text-amber-800' },
   disconnected: { label: 'Not connected', style: 'bg-slate-100 text-slate-700' },
   logged_out: { label: 'Logged out', style: 'bg-red-100 text-red-800' },
@@ -49,6 +48,7 @@ export function Dashboard() {
   const [counts, setCounts] = useState({ today: 0, total: 0, failed: 0 });
   const [contacts, setContacts] = useState<SavedContact[]>([]);
   const [search, setSearch] = useState('');
+  const [phone, setPhone] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -90,7 +90,7 @@ export function Dashboard() {
     return () => clearTimeout(timer);
   }, [loadContacts, search]);
 
-  // Live updates: the QR, the connection status and new contacts as they are saved.
+  // Live updates: the pairing code, the connection status and new contacts as they are saved.
   useEffect(() => {
     const channel = supabase
       .channel(`dashboard-${userId}`)
@@ -105,18 +105,18 @@ export function Dashboard() {
   }, [userId, loadContacts]);
 
   // Safety net while linking, in case a Realtime message is missed.
-  const linking = session?.status === 'qr' || session?.status === 'connecting';
+  const linking = session?.status === 'pairing' || session?.status === 'connecting';
   useEffect(() => {
     if (!linking) return;
     const timer = setInterval(() => void loadSession(), 4000);
     return () => clearInterval(timer);
   }, [linking, loadSession]);
 
-  async function run(path: string) {
+  async function run(path: string, body?: object) {
     setBusy(true);
     setError('');
     try {
-      await api(path);
+      await api(path, body);
       await loadSession();
     } catch (e) {
       setError((e as Error).message);
@@ -165,14 +165,19 @@ export function Dashboard() {
       {error && <Notice kind="error">{error}</Notice>}
 
       <Card title="WhatsApp" action={<Badge {...STATUS[status]} />}>
-        {status === 'qr' && session?.qr && (
+        {status === 'pairing' && session?.pairing_code && (
           <div className="mb-4 flex flex-col items-center gap-3 text-center">
-            <div className="rounded-xl border border-slate-200 bg-white p-3">
-              <QRCodeSVG value={session.qr} size={232} marginSize={1} />
+            <div
+              className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-4 font-mono text-3xl font-semibold tracking-[0.2em] sm:text-4xl"
+              aria-label="Pairing code"
+            >
+              {session.pairing_code.slice(0, 4)}-{session.pairing_code.slice(4)}
             </div>
-            <p className="max-w-sm text-sm text-slate-600">
-              On your phone open WhatsApp → Settings → Linked devices → Link a device, then point it at this code.
-            </p>
+            <ol className="max-w-sm list-decimal space-y-1 pl-5 text-left text-sm text-slate-600">
+              <li>On your phone open WhatsApp → Settings → Linked devices.</li>
+              <li>Tap Link a device, then “Link with phone number instead”.</li>
+              <li>Type the code above. It stops working after a few minutes.</li>
+            </ol>
           </div>
         )}
         {status === 'connected' && (
@@ -191,24 +196,45 @@ export function Dashboard() {
             {subscribed ? 'Connect your WhatsApp to start saving contacts.' : 'Subscribe first, then connect your WhatsApp.'}
           </p>
         )}
+        {!live && subscribed && (
+          <form
+            className="flex flex-col gap-2 sm:flex-row sm:items-end"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void run('/api/session/start', { phone });
+            }}
+          >
+            <label className="block grow">
+              <span className="mb-1 block text-sm font-medium">Your WhatsApp number, with country code</span>
+              <input
+                className={inputClass}
+                type="tel"
+                inputMode="tel"
+                autoComplete="tel"
+                placeholder="+1 555 123 4567"
+                required
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+              />
+            </label>
+            <Button type="submit" disabled={busy} className="shrink-0">
+              {busy ? 'Getting code…' : 'Connect'}
+            </Button>
+          </form>
+        )}
         <div className="flex flex-wrap gap-2">
-          {!live &&
-            (subscribed ? (
-              <Button disabled={busy} onClick={() => void run('/api/session/start')}>
-                Connect
-              </Button>
-            ) : (
-              <>
-                <Button disabled>Connect</Button>
-                <Link
-                  to="/billing"
-                  className="inline-flex min-h-11 items-center rounded-lg px-3 text-sm font-medium text-accent-dark underline"
-                >
-                  Subscribe to connect
-                </Link>
-              </>
-            ))}
-          {(live || status === 'logged_out') && (
+          {!live && !subscribed && (
+            <>
+              <Button disabled>Connect</Button>
+              <Link
+                to="/billing"
+                className="inline-flex min-h-11 items-center rounded-lg px-3 text-sm font-medium text-accent-dark underline"
+              >
+                Subscribe to connect
+              </Link>
+            </>
+          )}
+          {live && (
             <Button variant="secondary" disabled={busy} onClick={() => void run('/api/session/logout')}>
               {status === 'connected' ? 'Disconnect' : 'Cancel'}
             </Button>

@@ -27,8 +27,8 @@ export interface Settings {
 
 export interface WaSession {
   user_id: string;
-  status: 'disconnected' | 'qr' | 'connecting' | 'connected' | 'logged_out';
-  qr: string | null;
+  status: 'disconnected' | 'pairing' | 'connecting' | 'connected' | 'logged_out';
+  pairing_code: string | null;
   phone: string | null;
   last_connected_at: string | null;
 }

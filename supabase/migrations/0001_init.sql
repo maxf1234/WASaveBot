@@ -21,8 +21,8 @@ create table settings (
 create table wa_sessions (
   user_id uuid primary key references profiles on delete cascade,
   status text not null default 'disconnected',
-  -- disconnected | qr | connecting | connected | logged_out
-  qr text,
+  -- disconnected | pairing | connecting | connected | logged_out
+  pairing_code text,      -- the 8-character code the user types into WhatsApp
   phone text,
   last_connected_at timestamptz
 );

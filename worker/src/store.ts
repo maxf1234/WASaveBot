@@ -12,11 +12,11 @@ export const ACTIVE_STATUSES = ['active', 'trialing'];
 export const isActive = (status: string | null | undefined): boolean =>
   ACTIVE_STATUSES.includes(status ?? '');
 
-export type SessionStatus = 'disconnected' | 'qr' | 'connecting' | 'connected' | 'logged_out';
+export type SessionStatus = 'disconnected' | 'pairing' | 'connecting' | 'connected' | 'logged_out';
 
 export interface SessionPatch {
   status?: SessionStatus;
-  qr?: string | null;
+  pairing_code?: string | null;
   phone?: string | null;
   last_connected_at?: string;
 }

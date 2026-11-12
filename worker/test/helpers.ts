@@ -135,6 +135,11 @@ export class FakeSocket implements ManagedSocket {
   async logout() {
     this.loggedOut = true;
   }
+  pairingRequests: string[] = [];
+  async requestPairingCode(phone: string) {
+    this.pairingRequests.push(phone);
+    return 'ABCD1234';
+  }
   sendMessage() {
     this.visibleCalls.push('sendMessage');
   }

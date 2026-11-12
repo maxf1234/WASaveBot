@@ -1,6 +1,6 @@
 # SaveBot
 
-A customer signs up, subscribes, links their own WhatsApp by scanning a QR code, and from then on every new person who messages them privately is saved as a contact in WhatsApp (and, optionally, in their phone's address book). The bot never sends anything from the linked account.
+A customer signs up, subscribes, links their own WhatsApp by typing a pairing code into it, and from then on every new person who messages them privately is saved as a contact in WhatsApp (and, optionally, in their phone's address book). The bot never sends anything from the linked account.
 
 ## What was reused, and from where
 
@@ -8,14 +8,14 @@ A customer signs up, subscribes, links their own WhatsApp by scanning a QR code,
 | --- | --- |
 | Auth state in Postgres with `BufferJSON`, including the `app-state-sync-key` protobuf fix-up | `contact-saver` and `whatsapp-filter`, `api/src/worker/dbAuthState.ts` |
 | One supervised socket per account: silent logger, `makeCacheableSignalKeyStore`, `Browsers.ubuntu('Chrome')`, `fetchLatestBaileysVersion`, `markOnlineOnConnect: false`, `syncFullHistory: false`, reading the disconnect code structurally, ignoring events from a replaced socket | `contact-saver`, `api/src/worker/sessionManager.ts` |
-| Logged-out handling (wipe the login, ask the user to relink) | `nba-whatsapp-poster`, `whatsapp.js` (the DealsPulse pattern) |
+| Pairing-code login shown on the page (`requestPairingCode`), and logged-out handling (wipe the login, ask the user to relink) | `nba-whatsapp-poster`, `whatsapp.js` (the DealsPulse pattern) and `contact-saver` |
 | `railway.json`: Dockerfile builder, health check path, `ON_FAILURE` restarts, `numReplicas: 1` | `contact-saver` and `whatsapp-auto-poster` |
 | `node:22-slim` Dockerfile layout | `whatsapp-auto-poster` and `nba-whatsapp-poster` |
 | Stripe env var names (`STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID`, `STRIPE_WEBHOOK_SECRET`), `client_reference_id` on Checkout, raw-body signature check, tolerance of out-of-order subscription events | `whatsapp-auto-poster`, `lib/billing.js` |
 | Phone masking in logs | `contact-saver`, `api/src/lib/logging.ts` |
 | Vercel SPA rewrite in `vercel.json` | `affiliate-2.0` |
 
-Where those repos differ from the build document, the document won: QR login instead of a pairing code, Supabase instead of a direct Postgres connection, Express instead of Fastify, the Stripe SDK instead of hand-rolled `fetch`, `baileys@7.0.0-rc14` instead of `@whiskeysockets/baileys@6.x`. None of my repos used Supabase, so the Supabase client setup is new.
+Where those repos differ from the build document, the document won: Supabase instead of a direct Postgres connection, Express instead of Fastify, the Stripe SDK instead of hand-rolled `fetch`, `baileys@7.0.0-rc14` instead of `@whiskeysockets/baileys@6.x`. None of my repos used Supabase, so the Supabase client setup is new. One later change overrides the document: linking uses a pairing code, not a QR code, so `wa_sessions` has `pairing_code` and status `pairing` where the document had `qr`.
 
 ## Layout
 
@@ -107,6 +107,6 @@ The worker tests cover the save rules, the queue, sessions and reconnects, the H
 - **Unresolved senders**: when a sender arrives as `@lid` and WhatsApp gives no phone number, a row is stored with status `unresolved` and `phone` set to `lid:<id>` (the column is `not null` and unique per user). It is replaced by a normal row once the number resolves.
 - **Existing contacts**: any contact WhatsApp reports with a saved name is recorded as `existing` and never touched. The list WhatsApp sends right after linking (`messaging-history.set`) is read for this too, in addition to `contacts.upsert` and `contacts.update`.
 - **Failed saves** are retried once, then recorded as `failed` and not attempted again.
-- **Unscanned QR**: if nobody scans before WhatsApp gives up, the session goes back to "Not connected" instead of generating QR codes forever.
+- **Linking**: the user enters their own WhatsApp number, the worker asks WhatsApp for an 8-character code, and the user types it under Linked devices → Link a device → Link with phone number instead. If nobody enters it before WhatsApp gives up, the session goes back to "Not connected" instead of retrying forever. Pressing Connect again with a different number starts over.
 - **Subscription changes**: every Stripe event triggers a fresh lookup of the customer's subscriptions, so events arriving out of order cannot leave a wrong status.
 - **Invisible to the other person**: the only call made to WhatsApp is `addOrEditContact`. A test fails the build if the worker source ever calls `sendMessage`, read receipts or presence.

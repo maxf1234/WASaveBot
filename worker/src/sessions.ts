@@ -3,7 +3,7 @@
  *
  * Reused from my contact-saver / whatsapp-filter workers: socket options, the
  * silent logger, the cached signal key store and the reconnect supervision.
- * Different here: QR login instead of a pairing code, and state in Supabase.
+ * The pairing-code login is theirs too; what differs is that state lives in Supabase.
  */
 
 import makeWASocket, {
@@ -26,6 +26,7 @@ export interface ManagedSocket extends WaSocketLike {
   authState: { creds: { me?: unknown } };
   end(error: Error | undefined): void;
   logout(): Promise<void>;
+  requestPairingCode(phone: string): Promise<string>;
 }
 
 export type SocketFactory = (auth: AuthenticationState) => Promise<ManagedSocket> | ManagedSocket;
@@ -42,6 +43,10 @@ interface Live {
   /** Set when we close the socket on purpose, so its close event is ignored. */
   closing: boolean;
   attempts: number;
+  /** The number to pair with, until pairing succeeds. Digits only. */
+  pairPhone?: string;
+  /** The socket a code has already been requested on (one code per socket). */
+  codeRequestedOn?: ManagedSocket;
   timer?: NodeJS.Timeout;
 }
 
@@ -101,22 +106,36 @@ export class SessionManager {
     }
   }
 
-  /** Start (or keep) a user's socket. Safe to call twice. */
-  async start(userId: string): Promise<void> {
-    if (this.#live.has(userId)) return;
+  /**
+   * Start (or keep) a user's socket. Safe to call twice.
+   *
+   * `pairPhone` is the user's own WhatsApp number (digits, with country code).
+   * It is only needed the first time: with a stored login the socket just
+   * reconnects and no code is involved.
+   */
+  async start(userId: string, pairPhone?: string): Promise<void> {
+    const existing = this.#live.get(userId);
+    if (existing) {
+      // Pressing Connect again with a corrected number restarts the pairing.
+      const paired = Boolean(existing.sock?.authState.creds.me);
+      if (!pairPhone || paired || existing.pairPhone === pairPhone) return;
+      this.#drop(userId, existing);
+      await this.store.deleteAuth(userId);
+    }
     const live: Live = {
       saver: new ContactSaver(userId, this.store, this.policy, () => this.#live.get(userId)?.sock),
       closing: false,
       attempts: 0,
+      pairPhone,
     };
     this.#live.set(userId, live);
     try {
       await live.saver.load();
-      await this.store.updateSession(userId, { status: 'connecting', qr: null });
+      await this.store.updateSession(userId, { status: 'connecting', pairing_code: null });
       await this.#open(userId, live);
     } catch (error) {
       this.#drop(userId, live);
-      await this.store.updateSession(userId, { status: 'disconnected', qr: null }).catch(() => {});
+      await this.store.updateSession(userId, { status: 'disconnected', pairing_code: null }).catch(() => {});
       throw error;
     }
   }
@@ -125,7 +144,7 @@ export class SessionManager {
   async stop(userId: string): Promise<void> {
     const live = this.#live.get(userId);
     if (live) this.#drop(userId, live);
-    await this.store.updateSession(userId, { status: 'disconnected', qr: null });
+    await this.store.updateSession(userId, { status: 'disconnected', pairing_code: null });
   }
 
   /** Unlink this device from the user's WhatsApp and forget the login. */
@@ -139,7 +158,7 @@ export class SessionManager {
       this.#drop(userId, live);
     }
     await this.store.deleteAuth(userId);
-    await this.store.updateSession(userId, { status: 'disconnected', qr: null, phone: null });
+    await this.store.updateSession(userId, { status: 'disconnected', pairing_code: null, phone: null });
   }
 
   async stopAll(): Promise<void> {
@@ -198,16 +217,38 @@ export class SessionManager {
     sock: ManagedSocket,
     update: ConnectionUpdate,
   ): Promise<void> {
-    if (update.qr) {
-      await this.store.updateSession(userId, { status: 'qr', qr: update.qr });
+    // Baileys signals "ready to link a new device" by offering a QR. We do not
+    // show it: we ask for a pairing code for the user's number instead.
+    if (update.qr && live.codeRequestedOn !== sock) {
+      live.codeRequestedOn = sock;
+      if (!live.pairPhone) {
+        // A stored login that WhatsApp no longer accepts, and no number to pair with.
+        this.#drop(userId, live);
+        await this.store.deleteAuth(userId);
+        await this.store.updateSession(userId, { status: 'logged_out', pairing_code: null });
+        return;
+      }
+      try {
+        const code = await sock.requestPairingCode(live.pairPhone);
+        if (this.#live.get(userId) !== live || live.sock !== sock) return;
+        await this.store.updateSession(userId, { status: 'pairing', pairing_code: code });
+        log.info('pairing code issued', { userId, phone: maskPhone(live.pairPhone) });
+      } catch (error) {
+        log.error('WhatsApp refused a pairing code', { userId, error: errorMessage(error) });
+        this.#drop(userId, live);
+        await this.store.deleteAuth(userId);
+        await this.store.updateSession(userId, { status: 'disconnected', pairing_code: null });
+      }
+      return;
     }
 
     if (update.connection === 'open') {
       live.attempts = 0;
+      live.pairPhone = undefined;
       const phone = userPart(sock.user?.id ?? '') || null;
       await this.store.updateSession(userId, {
         status: 'connected',
-        qr: null,
+        pairing_code: null,
         phone,
         last_connected_at: new Date().toISOString(),
       });
@@ -226,22 +267,22 @@ export class SessionManager {
       // Removed from Linked Devices. The login is dead; reconnecting would loop.
       this.#drop(userId, live);
       await this.store.deleteAuth(userId);
-      await this.store.updateSession(userId, { status: 'logged_out', qr: null });
+      await this.store.updateSession(userId, { status: 'logged_out', pairing_code: null });
       log.warn('logged out by WhatsApp', { userId });
       return;
     }
 
     const paired = Boolean(sock.authState.creds.me);
     if (!paired && code !== DisconnectReason.restartRequired) {
-      // Nobody scanned the QR before WhatsApp gave up. Stop quietly; the user
+      // Nobody entered the code before WhatsApp gave up. Stop quietly; the user
       // presses Connect again when they are ready.
       this.#drop(userId, live);
       await this.store.deleteAuth(userId);
-      await this.store.updateSession(userId, { status: 'disconnected', qr: null });
+      await this.store.updateSession(userId, { status: 'disconnected', pairing_code: null });
       return;
     }
 
-    await this.store.updateSession(userId, { status: 'connecting', qr: null });
+    await this.store.updateSession(userId, { status: 'connecting', pairing_code: null });
     log.warn('WhatsApp disconnected, reconnecting', { userId, code });
     this.#scheduleReconnect(userId, live);
   }

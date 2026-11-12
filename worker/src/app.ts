@@ -19,7 +19,7 @@ export interface AppDeps {
   billing: Pick<Billing, 'checkoutUrl' | 'portalUrl' | 'cancelAll' | 'handleEvent'>;
   sessions: {
     count(): number;
-    start(userId: string): Promise<void>;
+    start(userId: string, pairPhone?: string): Promise<void>;
     logout(userId: string): Promise<void>;
   };
 }
@@ -75,11 +75,19 @@ export function createApp(deps: AppDeps): express.Express {
 
   app.post(
     '/api/session/start',
-    authed(async (_req, res, user) => {
+    authed(async (req, res, user) => {
       if (!(await deps.store.getPolicy(user.id)).subscribed) {
         throw new HttpError(402, 'Subscribe to connect WhatsApp');
       }
-      await deps.sessions.start(user.id);
+      // The user's own number, with country code: "+1 (555) 123-4567" -> "15551234567".
+      const raw = (req.body as { phone?: unknown } | undefined)?.phone;
+      const phone = typeof raw === 'string' ? raw.replace(/\D/g, '').replace(/^00/, '') : '';
+      const valid = /^[1-9]\d{7,14}$/.test(phone);
+      // Without a number we can only resume a login that is already stored.
+      if (!valid && !(await deps.store.hasAuth(user.id))) {
+        throw new HttpError(400, 'Enter your WhatsApp number with the country code, for example +1 555 123 4567');
+      }
+      await deps.sessions.start(user.id, valid ? phone : undefined);
       res.json({ ok: true });
     }),
   );
