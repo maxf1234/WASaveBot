@@ -19,6 +19,7 @@ const CONTACT_STATUS: Record<SavedContact['status'], { label: string; style: str
   existing: { label: 'Already a contact', style: 'bg-slate-100 text-slate-700' },
   failed: { label: 'Failed', style: 'bg-red-100 text-red-800' },
   unresolved: { label: 'Number unknown', style: 'bg-amber-100 text-amber-800' },
+  pending: { label: 'Not saved yet', style: 'bg-slate-100 text-slate-700' },
 };
 
 const COLUMNS = 'id, phone, push_name, saved_name, status, error, created_at';
@@ -45,7 +46,8 @@ export function Dashboard() {
 
   const [session, setSession] = useState<WaSession | null>(null);
   const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [counts, setCounts] = useState({ today: 0, total: 0, failed: 0 });
+  const [counts, setCounts] = useState({ today: 0, total: 0, failed: 0, pending: 0 });
+  const [notice, setNotice] = useState('');
   const [contacts, setContacts] = useState<SavedContact[]>([]);
   const [search, setSearch] = useState('');
   const [phone, setPhone] = useState('');
@@ -64,14 +66,15 @@ export function Dashboard() {
     let list = supabase.from('saved_contacts').select(COLUMNS).eq('user_id', userId);
     const term = safeTerm(search);
     if (term) list = list.or(`saved_name.ilike.%${term}%,push_name.ilike.%${term}%,phone.ilike.%${term.replace(/^\+/, '')}%`);
-    const [rows, today, total, failed] = await Promise.all([
+    const [rows, today, total, failed, pending] = await Promise.all([
       list.order('created_at', { ascending: false }).limit(50),
       count().eq('status', 'saved').gte('created_at', midnight.toISOString()),
       count().eq('status', 'saved'),
       count().eq('status', 'failed'),
+      count().eq('status', 'pending'),
     ]);
     setContacts((rows.data as SavedContact[] | null) ?? []);
-    setCounts({ today: today.count ?? 0, total: total.count ?? 0, failed: failed.count ?? 0 });
+    setCounts({ today: today.count ?? 0, total: total.count ?? 0, failed: failed.count ?? 0, pending: pending.count ?? 0 });
   }, [userId, search]);
 
   useEffect(() => {
@@ -124,6 +127,32 @@ export function Dashboard() {
     setBusy(false);
   }
 
+  async function backfill() {
+    setBusy(true);
+    setError('');
+    try {
+      const { queued } = await api<{ queued: number }>('/api/contacts/backfill');
+      setNotice(
+        queued
+          ? `Saving ${queued} ${queued === 1 ? 'person' : 'people'}, a few seconds apart. They show as Saved below as each one finishes.`
+          : 'Those are already being saved.',
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    }
+    setBusy(false);
+  }
+
+  async function retry(contactPhone: string) {
+    setError('');
+    try {
+      await api('/api/contacts/retry', { phone: contactPhone });
+      setNotice('Trying that contact again.');
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   async function toggle(next: boolean) {
     setEnabled(next);
     const { error } = await supabase.from('settings').update({ enabled: next }).eq('user_id', userId);
@@ -147,7 +176,9 @@ export function Dashboard() {
     }
     const lines = [
       'name,phone,status,saved_at',
-      ...all.map((c) => [displayName(c), c.status === 'unresolved' ? '' : c.phone, c.status, c.created_at].map(csvCell).join(',')),
+      ...all
+        .filter((c) => c.status !== 'pending')
+        .map((c) => [displayName(c), c.status === 'unresolved' ? '' : c.phone, c.status, c.created_at].map(csvCell).join(',')),
     ];
     const url = URL.createObjectURL(new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8' }));
     const link = document.createElement('a');
@@ -163,6 +194,7 @@ export function Dashboard() {
   return (
     <>
       {error && <Notice kind="error">{error}</Notice>}
+      {notice && <Notice kind="success">{notice}</Notice>}
 
       <Card title="WhatsApp" action={<Badge {...STATUS[status]} />}>
         {status === 'pairing' && session?.pairing_code && (
@@ -252,6 +284,24 @@ export function Dashboard() {
         </div>
       </Card>
 
+      {counts.pending > 0 && (
+        <Card>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-base font-semibold">
+                {counts.pending} {counts.pending === 1 ? 'person' : 'people'} you already chat with {counts.pending === 1 ? "isn't" : "aren't"} saved
+              </h2>
+              <p className="text-sm text-slate-600">
+                Found in your recent chats when you linked WhatsApp. Saving them counts towards your daily cap.
+              </p>
+            </div>
+            <Button className="shrink-0" disabled={busy || status !== 'connected'} onClick={() => void backfill()}>
+              Save them
+            </Button>
+          </div>
+        </Card>
+      )}
+
       <div className="grid grid-cols-3 gap-3">
         {[
           ['Saved today', counts.today],
@@ -307,6 +357,15 @@ export function Dashboard() {
                     </td>
                     <td className="px-2 py-2.5" title={c.error ?? undefined}>
                       <Badge {...CONTACT_STATUS[c.status]} />
+                      {c.status === 'failed' && status === 'connected' && (
+                        <button
+                          type="button"
+                          className="ml-2 inline-flex min-h-9 items-center text-sm font-medium text-accent-dark underline"
+                          onClick={() => void retry(c.phone)}
+                        >
+                          Retry
+                        </button>
+                      )}
                     </td>
                     <td className="whitespace-nowrap px-4 py-2.5 text-xs text-slate-500 sm:pr-0 sm:text-sm">
                       {new Date(c.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}

@@ -21,6 +21,7 @@ export interface AppDeps {
     count(): number;
     start(userId: string, pairPhone?: string): Promise<void>;
     logout(userId: string): Promise<void>;
+    connectedSaver(userId: string): { backfill(): Promise<number>; retry(phone: string): Promise<boolean> } | undefined;
   };
 }
 
@@ -96,6 +97,29 @@ export function createApp(deps: AppDeps): express.Express {
     '/api/session/logout',
     authed(async (_req, res, user) => {
       await deps.sessions.logout(user.id);
+      res.json({ ok: true });
+    }),
+  );
+
+  // Save the people from existing chats that were found when WhatsApp was linked.
+  app.post(
+    '/api/contacts/backfill',
+    authed(async (_req, res, user) => {
+      const saver = deps.sessions.connectedSaver(user.id);
+      if (!saver) throw new HttpError(409, 'Connect WhatsApp first');
+      res.json({ queued: await saver.backfill() });
+    }),
+  );
+
+  // Try one failed contact again.
+  app.post(
+    '/api/contacts/retry',
+    authed(async (req, res, user) => {
+      const phone = (req.body as { phone?: unknown } | undefined)?.phone;
+      if (typeof phone !== 'string' || !/^\d{5,20}$/.test(phone)) throw new HttpError(400, 'Unknown contact');
+      const saver = deps.sessions.connectedSaver(user.id);
+      if (!saver) throw new HttpError(409, 'Connect WhatsApp first');
+      if (!(await saver.retry(phone))) throw new HttpError(404, 'Nothing to retry for that contact');
       res.json({ ok: true });
     }),
   );

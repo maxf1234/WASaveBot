@@ -43,6 +43,7 @@ interface Live {
   /** Set when we close the socket on purpose, so its close event is ignored. */
   closing: boolean;
   attempts: number;
+  connected?: boolean;
   /** The number to pair with, until pairing succeeds. Digits only. */
   pairPhone?: string;
   /** The socket a code has already been requested on (one code per socket). */
@@ -84,7 +85,19 @@ export class SessionManager {
     private policy: PolicyCache,
     private makeSocket: SocketFactory = baileysSocketFactory,
     private setTimer: (fn: () => void, ms: number) => NodeJS.Timeout = setTimeout,
+    private options: {
+      /** Encrypts wa_auth. Only tests leave it out. */
+      authKey?: Buffer;
+      /** Called when WhatsApp ends a login the user did not end themselves. */
+      onLoggedOut?: (userId: string) => void;
+    } = {},
   ) {}
+
+  /** The user's saver, only while their WhatsApp is actually connected. */
+  connectedSaver(userId: string): ContactSaver | undefined {
+    const live = this.#live.get(userId);
+    return live?.sock && live.connected ? live.saver : undefined;
+  }
 
   /** Sockets that exist right now (connected or on their way). */
   count(): number {
@@ -175,10 +188,11 @@ export class SessionManager {
       // Already gone, which is what we wanted.
     }
     live.sock = undefined;
+    live.connected = false;
   }
 
   async #open(userId: string, live: Live): Promise<void> {
-    const { state, saveCreds } = await useSupabaseAuthState(this.store, userId);
+    const { state, saveCreds } = await useSupabaseAuthState(this.store, userId, this.options.authKey);
     const sock = await this.makeSocket(state);
     if (live.closing) {
       sock.end(undefined);
@@ -207,7 +221,7 @@ export class SessionManager {
     sock.ev.on('contacts.update', onContacts);
     // The contact list WhatsApp sends right after linking arrives here.
     sock.ev.on('messaging-history.set', ((sync: { contacts?: IncomingContact[] }) => {
-      if (current() && sync.contacts?.length) void live.saver.onContacts(sync.contacts);
+      if (current() && sync.contacts?.length) void live.saver.onHistory(sync.contacts);
     }) as never);
   }
 
@@ -226,6 +240,7 @@ export class SessionManager {
         this.#drop(userId, live);
         await this.store.deleteAuth(userId);
         await this.store.updateSession(userId, { status: 'logged_out', pairing_code: null });
+        this.options.onLoggedOut?.(userId);
         return;
       }
       try {
@@ -245,6 +260,7 @@ export class SessionManager {
     if (update.connection === 'open') {
       live.attempts = 0;
       live.pairPhone = undefined;
+      live.connected = true;
       const phone = userPart(sock.user?.id ?? '') || null;
       await this.store.updateSession(userId, {
         status: 'connected',
@@ -262,6 +278,7 @@ export class SessionManager {
     const code = (update.lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)
       ?.output?.statusCode;
     live.sock = undefined;
+    live.connected = false;
 
     if (code === DisconnectReason.loggedOut) {
       // Removed from Linked Devices. The login is dead; reconnecting would loop.
@@ -269,6 +286,7 @@ export class SessionManager {
       await this.store.deleteAuth(userId);
       await this.store.updateSession(userId, { status: 'logged_out', pairing_code: null });
       log.warn('logged out by WhatsApp', { userId });
+      this.options.onLoggedOut?.(userId);
       return;
     }
 

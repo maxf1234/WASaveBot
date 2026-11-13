@@ -12,6 +12,7 @@ A customer signs up, subscribes, links their own WhatsApp by typing a pairing co
 | `railway.json`: Dockerfile builder, health check path, `ON_FAILURE` restarts, `numReplicas: 1` | `contact-saver` and `whatsapp-auto-poster` |
 | `node:22-slim` Dockerfile layout | `whatsapp-auto-poster` and `nba-whatsapp-poster` |
 | Stripe env var names (`STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID`, `STRIPE_WEBHOOK_SECRET`), `client_reference_id` on Checkout, raw-body signature check, tolerance of out-of-order subscription events | `whatsapp-auto-poster`, `lib/billing.js` |
+| AES-256-GCM encryption of the stored WhatsApp login keys | `contact-saver`, `api/src/lib/crypto.ts` (same idea, key in `WA_AUTH_ENCRYPTION_KEY`) |
 | Phone masking in logs | `contact-saver`, `api/src/lib/logging.ts` |
 | Vercel SPA rewrite in `vercel.json` | `affiliate-2.0` |
 
@@ -38,7 +39,7 @@ The web app reads its own rows straight from Supabase under RLS. Anything touchi
 
 ### 2. Stripe (test mode)
 
-1. Create a product with a monthly recurring price. Copy the price ID (`price_...`).
+1. Create a product with a monthly recurring price of $9.99. Copy the price ID (`price_...`).
 2. Settings → Billing → Customer portal: activate it and allow cancelling subscriptions.
 3. After the worker is deployed, add a webhook endpoint at `https://<worker>/api/stripe/webhook` for these events: `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.payment_failed`. Copy its signing secret (`whsec_...`).
 
@@ -64,6 +65,12 @@ stripe listen --forward-to localhost:3000/api/stripe/webhook
 
 1. New project → Deploy from GitHub repo → this repo. In the service settings set **Root Directory** to `worker`. `railway.json` and the `Dockerfile` do the rest.
 2. Add the variables from `worker/.env.example`. `WEB_URL` is the Vercel URL with no trailing slash. Leave `PORT` unset; Railway provides it.
+   - `WA_AUTH_ENCRYPTION_KEY` is required. Generate it once and keep a copy somewhere safe; if it is lost or changed, every customer has to link WhatsApp again.
+
+     ```bash
+     node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+     ```
+   - `RESEND_API_KEY` and `EMAIL_FROM` are optional. With both set, a customer is emailed when WhatsApp logs them out. `EMAIL_FROM` must be on a domain verified at resend.com. Without them the worker runs normally and sends no email.
 3. Keep it at **one replica**. Two replicas would open two sockets for the same WhatsApp login and they would knock each other offline. `railway.json` pins `numReplicas: 1`.
 4. Generate a public domain. `GET /health` returns `{"ok":true,"sockets":N}`.
 
@@ -75,7 +82,7 @@ stripe listen --forward-to localhost:3000/api/stripe/webhook
 
 ## Renaming the product
 
-Change `APP_NAME` in `web/src/brand.ts`. That is the only place the name appears to users (page title, header, login, footer, Terms, Privacy). The `<title>` in `web/index.html` is overwritten at startup; change it too if you care about the first few milliseconds. The npm package names (`savebot-worker`, `savebot-web`) are internal.
+Change `APP_NAME` in `web/src/brand.ts`. That is the only place the name appears in the app (page title, header, login, footer, Terms, Privacy). The worker uses the name in one place, the disconnect email, and reads it from its `APP_NAME` variable on Railway. The `<title>` in `web/index.html` is overwritten at startup; change it too if you care about the first few milliseconds. The npm package names (`savebot-worker`, `savebot-web`) are internal.
 
 The accent colour is the one `--color-accent` pair in `web/src/index.css`.
 
@@ -85,6 +92,7 @@ Prices live in Stripe, not in code.
 
 1. Stripe → the product → add a new price.
 2. Set the worker's `STRIPE_PRICE_ID` to the new price ID and redeploy.
+3. Change `PRICE_LABEL` in `web/src/brand.ts` (the text on the Billing page; currently `$9.99 / month`) and redeploy the web app.
 
 New subscribers get the new price. Existing subscribers stay on their old price until you migrate them in Stripe. The trial length is `TRIAL_DAYS` (0 means no trial).
 
@@ -106,7 +114,11 @@ The worker tests cover the save rules, the queue, sessions and reconnects, the H
 - **Names**: the sender's WhatsApp name is trimmed, stripped of control and invisible characters and cut to 60 characters. A name with no letter or digit left (empty, emoji only) gets `<fallback prefix> <last 4 digits>`.
 - **Unresolved senders**: when a sender arrives as `@lid` and WhatsApp gives no phone number, a row is stored with status `unresolved` and `phone` set to `lid:<id>` (the column is `not null` and unique per user). It is replaced by a normal row once the number resolves.
 - **Existing contacts**: any contact WhatsApp reports with a saved name is recorded as `existing` and never touched. The list WhatsApp sends right after linking (`messaging-history.set`) is read for this too, in addition to `contacts.upsert` and `contacts.update`.
-- **Failed saves** are retried once, then recorded as `failed` and not attempted again.
+- **Failed saves** are retried once, then recorded as `failed`. They are not attempted again unless the customer presses Retry on that row in the dashboard.
+- **Backfill**: when WhatsApp is linked it sends the recent chat list. A private chat with no saved name is stored as `pending` and nothing is done with it until the customer presses "Save them" on the dashboard; then they go through the same queue, pacing and daily cap. Ones the cap cuts off stay `pending`. A pending person who messages is saved straight away.
+- **Encrypted logins**: every value in `wa_auth` is AES-256-GCM encrypted with `WA_AUTH_ENCRYPTION_KEY`. The database alone cannot log in to anyone's WhatsApp.
+- **Disconnect email**: when WhatsApp logs a customer out (not when they press Disconnect, and not when their subscription lapses) they get one email with a link back to the dashboard.
+- **No grace period**: the moment Stripe reports a status other than `active` or `trialing` (including a failed payment), that customer's socket is closed and saving stops. It resumes on its own, with no new pairing, when the status is good again.
 - **Linking**: the user enters their own WhatsApp number, the worker asks WhatsApp for an 8-character code, and the user types it under Linked devices → Link a device → Link with phone number instead. If nobody enters it before WhatsApp gives up, the session goes back to "Not connected" instead of retrying forever. Pressing Connect again with a different number starts over.
 - **Subscription changes**: every Stripe event triggers a fresh lookup of the customer's subscriptions, so events arriving out of order cannot leave a wrong status.
 - **Invisible to the other person**: the only call made to WhatsApp is `addOrEditContact`. A test fails the build if the worker source ever calls `sendMessage`, read receipts or presence.

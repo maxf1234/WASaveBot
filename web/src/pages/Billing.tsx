@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { PRICE_LABEL } from '../brand';
 import { Button, Card, Notice } from '../components/ui';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
@@ -73,6 +74,8 @@ export function Billing() {
         ) : (
           <>
             <dl className="mb-5 grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm">
+              <dt className="text-slate-500">Plan</dt>
+              <dd className="font-medium">{PRICE_LABEL}</dd>
               <dt className="text-slate-500">Status</dt>
               <dd className="font-medium">{LABELS[status] ?? status}</dd>
               {renews && subscribed && (

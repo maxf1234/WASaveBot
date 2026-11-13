@@ -5,19 +5,33 @@
  * Returns the same shape as Baileys' useMultiFileAuthState. Baileys hands us
  * Buffers and expects Buffers back, which JSON does not carry, so BufferJSON's
  * replacer/reviver do the round trip (the same pair Baileys' file store uses).
+ * Every value is AES-256-GCM encrypted before it is written.
  */
 
 import { BufferJSON, initAuthCreds, proto } from 'baileys';
 import type { AuthenticationCreds, AuthenticationState, SignalDataTypeMap } from 'baileys';
+import { isSealed, open, seal } from './crypto.js';
 import type { Store } from './store.js';
 
-const toJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value, BufferJSON.replacer));
-const fromJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value), BufferJSON.reviver);
 
 export async function useSupabaseAuthState(
   store: Store,
   userId: string,
+  /** Encryption key for the stored values. Only tests leave it out. */
+  key?: Buffer,
 ): Promise<{ state: AuthenticationState; saveCreds: () => Promise<void> }> {
+  const toJson = (value: unknown): unknown => {
+    const plain = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
+    return key ? seal(key, plain) : plain;
+  };
+  const fromJson = (value: unknown): unknown => {
+    if (isSealed(value)) {
+      if (!key) throw new Error('wa_auth is encrypted but no key is configured');
+      value = open(key, value);
+    }
+    return JSON.parse(JSON.stringify(value), BufferJSON.reviver);
+  };
+
   const stored = (await store.getAuth(userId, ['creds'])).get('creds');
   const creds = (stored ? fromJson(stored) : initAuthCreds()) as AuthenticationCreds;
 

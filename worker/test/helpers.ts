@@ -85,8 +85,15 @@ export class MemoryStore implements Store {
     this.deletedUsers.push(userId);
     this.profiles.delete(userId);
   }
-  async loadPhones(userId: string) {
-    return this.rows(userId).map((r) => r.phone);
+  async loadContacts(userId: string) {
+    return this.rows(userId).map((r) => ({ phone: r.phone, status: r.status, push_name: r.push_name ?? null, lid: r.lid ?? null }));
+  }
+  async getContact(userId: string, phone: string) {
+    return (await this.loadContacts(userId)).find((r) => r.phone === phone) ?? null;
+  }
+  async updateContact(userId: string, phone: string, patch: Partial<ContactRow>) {
+    const row = this.rows(userId).find((r) => r.phone === phone);
+    if (row) Object.assign(row, patch, { created_at: new Date().toISOString() });
   }
   async countSavedSince(userId: string, sinceIso: string) {
     return this.rows(userId).filter((r) => r.status === 'saved' && r.created_at >= sinceIso).length;

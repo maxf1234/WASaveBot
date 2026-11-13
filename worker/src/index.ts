@@ -2,6 +2,8 @@ import Stripe from 'stripe';
 import { createApp } from './app.js';
 import { createTokenVerifier } from './auth.js';
 import { Billing } from './billing.js';
+import { parseKey } from './crypto.js';
+import { createMailer } from './email.js';
 import { loadEnv } from './env.js';
 import { errorMessage, log } from './log.js';
 import { SessionManager } from './sessions.js';
@@ -10,7 +12,23 @@ import { createSupabaseStore, PolicyCache } from './store.js';
 const env = loadEnv();
 const store = createSupabaseStore(env.supabaseUrl, env.supabaseServiceRoleKey);
 const policy = new PolicyCache(store);
-const sessions = new SessionManager(store, policy);
+const mailer = createMailer({
+  apiKey: env.resendApiKey,
+  from: env.emailFrom,
+  appName: env.appName,
+  webUrl: env.webUrl,
+});
+if (!env.resendApiKey || !env.emailFrom) log.warn('RESEND_API_KEY / EMAIL_FROM not set: disconnect emails are off');
+
+const sessions = new SessionManager(store, policy, undefined, undefined, {
+  authKey: parseKey(env.waAuthEncryptionKey),
+  onLoggedOut: (userId) => {
+    void store
+      .getProfile(userId)
+      .then((profile) => (profile?.email ? mailer.sendLoggedOut(profile.email) : undefined))
+      .catch((error) => log.warn('could not email about logout', { error: errorMessage(error) }));
+  },
+});
 const stripe = new Stripe(env.stripeSecretKey);
 const billing = new Billing(stripe, store, policy, sessions, {
   priceId: env.stripePriceId,

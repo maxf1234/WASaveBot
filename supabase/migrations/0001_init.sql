@@ -30,7 +30,7 @@ create table wa_sessions (
 create table wa_auth (
   user_id uuid references profiles on delete cascade,
   key text,
-  value jsonb not null,
+  value jsonb not null,    -- AES-256-GCM ciphertext, sealed by the worker
   primary key (user_id, key)
 );
 
@@ -41,7 +41,7 @@ create table saved_contacts (
   lid text,
   push_name text,
   saved_name text,
-  status text not null,         -- saved | existing | failed | unresolved
+  status text not null,         -- saved | existing | failed | unresolved | pending
   error text,
   created_at timestamptz default now(),
   unique (user_id, phone)

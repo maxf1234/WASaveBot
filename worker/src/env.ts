@@ -16,6 +16,12 @@ export interface Env {
   trialDays: number;
   webUrl: string;
   port: number;
+  /** 32-byte key (64 hex chars) that encrypts the WhatsApp logins in wa_auth. */
+  waAuthEncryptionKey: string;
+  /** Optional: without these two the disconnect email is simply not sent. */
+  resendApiKey?: string;
+  emailFrom?: string;
+  appName: string;
 }
 
 export function loadEnv(): Env {
@@ -31,5 +37,9 @@ export function loadEnv(): Env {
     // No trailing slash: it is compared against the browser's Origin header.
     webUrl: required('WEB_URL').replace(/\/+$/, ''),
     port: Number(process.env.PORT) || 3000,
+    waAuthEncryptionKey: required('WA_AUTH_ENCRYPTION_KEY'),
+    resendApiKey: process.env.RESEND_API_KEY?.trim() || undefined,
+    emailFrom: process.env.EMAIL_FROM?.trim() || undefined,
+    appName: process.env.APP_NAME?.trim() || 'SaveBot',
   };
 }

@@ -51,6 +51,10 @@ function setup(trialDays = 7) {
     start: async (id: string, phone?: string) => void calls.push(`start:${id}${phone ? `:${phone}` : ''}`),
     stop: async (id: string) => void calls.push(`stop:${id}`),
     logout: async (id: string) => void calls.push(`logout:${id}`),
+    connectedSaver: (id: string) =>
+      id === 'other'
+        ? undefined
+        : { backfill: async () => 4, retry: async (phone: string) => (calls.push(`retry:${phone}`), phone === '15551230001') },
   };
   const stripe = fakeStripe();
   const billing = new Billing(stripe.api, store, policy, sessions, { priceId: 'price_1', trialDays, webUrl: WEB });
@@ -214,4 +218,20 @@ test('account delete logs out, cancels the subscription and deletes the user', a
   assert.deepEqual(calls, [`logout:${USER}`]);
   assert.deepEqual(stripe.cancelled, ['sub_5']);
   assert.deepEqual(store.deletedUsers, [USER]);
+});
+
+test('backfill and retry need a JWT and a connected WhatsApp', async () => {
+  const { post, calls } = setup();
+  assert.equal((await post('/api/contacts/backfill')).status, 401);
+  assert.equal((await post('/api/contacts/retry')).status, 401);
+  assert.equal((await post('/api/contacts/backfill', 'good:other')).status, 409);
+  assert.equal((await post('/api/contacts/retry', 'good:other', { phone: '15551230001' })).status, 409);
+
+  const res = await post('/api/contacts/backfill', `good:${USER}`);
+  assert.deepEqual(await res.json(), { queued: 4 });
+  assert.equal((await post('/api/contacts/retry', `good:${USER}`, { phone: '15551230001' })).status, 200);
+  assert.equal((await post('/api/contacts/retry', `good:${USER}`, { phone: '15559999999' })).status, 404);
+  assert.equal((await post('/api/contacts/retry', `good:${USER}`, { phone: "1; drop" })).status, 400);
+  assert.equal((await post('/api/contacts/retry', `good:${USER}`)).status, 400);
+  assert.deepEqual(calls, ['retry:15551230001', 'retry:15559999999']);
 });

@@ -41,7 +41,8 @@ export interface Profile {
   subscription_status: string;
 }
 
-export type ContactStatus = 'saved' | 'existing' | 'failed' | 'unresolved';
+/** 'pending' = someone from an existing chat, found when linking, not saved yet. */
+export type ContactStatus = 'saved' | 'existing' | 'failed' | 'unresolved' | 'pending';
 
 export interface ContactRow {
   phone: string;
@@ -50,6 +51,13 @@ export interface ContactRow {
   saved_name?: string | null;
   status: ContactStatus;
   error?: string | null;
+}
+
+export interface KnownContact {
+  phone: string;
+  status: ContactStatus;
+  push_name: string | null;
+  lid: string | null;
 }
 
 export interface Store {
@@ -73,7 +81,10 @@ export interface Store {
   deleteUser(userId: string): Promise<void>;
 
   // saved_contacts
-  loadPhones(userId: string): Promise<string[]>;
+  loadContacts(userId: string): Promise<KnownContact[]>;
+  getContact(userId: string, phone: string): Promise<KnownContact | null>;
+  /** Change an existing row (a backfill or retry finishing). Also moves it to the top of the list. */
+  updateContact(userId: string, phone: string, patch: Partial<ContactRow>): Promise<void>;
   countSavedSince(userId: string, sinceIso: string): Promise<number>;
   /** Insert; a row that already exists for (user, phone) is left exactly as it is. */
   insertContact(userId: string, row: ContactRow): Promise<void>;
@@ -219,22 +230,45 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
       if (error) throw new Error(`delete user: ${error.message}`);
     },
 
-    async loadPhones(userId) {
-      const out: string[] = [];
+    async loadContacts(userId) {
+      const out: KnownContact[] = [];
       for (let from = 0; ; from += 1000) {
         const rows = check(
           await db
             .from('saved_contacts')
-            .select('phone')
+            .select('phone, status, push_name, lid')
             .eq('user_id', userId)
             .order('id')
             .range(from, from + 999),
           'load saved phones',
         );
-        for (const row of rows ?? []) out.push(row.phone as string);
+        out.push(...((rows ?? []) as KnownContact[]));
         if ((rows?.length ?? 0) < 1000) break;
       }
       return out;
+    },
+
+    async getContact(userId, phone) {
+      return check(
+        await db
+          .from('saved_contacts')
+          .select('phone, status, push_name, lid')
+          .eq('user_id', userId)
+          .eq('phone', phone)
+          .maybeSingle(),
+        'read saved_contact',
+      ) as KnownContact | null;
+    },
+
+    async updateContact(userId, phone, patch) {
+      check(
+        await db
+          .from('saved_contacts')
+          .update({ ...patch, created_at: new Date().toISOString() })
+          .eq('user_id', userId)
+          .eq('phone', phone),
+        'update saved_contact',
+      );
     },
 
     async countSavedSince(userId, sinceIso) {

@@ -39,6 +39,10 @@ export interface IncomingContact {
 
 interface Job {
   phone: string;
+  /** The row already exists (a backfill or a retry), so the result updates it. */
+  update?: boolean;
+  /** A retry the user asked for: run even though the number is already known. */
+  force?: boolean;
   lid: string | null;
   pushName: string | null;
   name: string;
@@ -56,6 +60,10 @@ const lidKey = (lidUser: string): string => `lid:${lidUser}`;
 export class ContactSaver {
   /** Every phone that has a saved_contacts row: saved, existing or failed. */
   #known = new Set<string>();
+  /** People from existing chats, found when linking, waiting for the user to say "save them". */
+  #candidates = new Map<string, { pushName: string | null; lid: string | null }>();
+  /** Push names seen in the history sync, by phone, for naming candidates. */
+  #pushNames = new Map<string, string>();
   /** Phones waiting in the queue. */
   #queued = new Set<string>();
   #jobs: Job[] = [];
@@ -85,7 +93,10 @@ export class ContactSaver {
   /** Load the known numbers and today's count. Called once, before the socket opens. */
   async load(): Promise<void> {
     if (this.#loaded) return;
-    for (const phone of await this.store.loadPhones(this.userId)) this.#known.add(phone);
+    for (const row of await this.store.loadContacts(this.userId)) {
+      if (row.status === 'pending') this.#candidates.set(row.phone, { pushName: row.push_name, lid: row.lid });
+      else this.#known.add(row.phone);
+    }
     const now = this.#now();
     this.#day = utcDay(now);
     this.#savedToday = await this.store.countSavedSince(this.userId, `${this.#day}T00:00:00Z`);
@@ -110,6 +121,94 @@ export class ContactSaver {
     return this.#inOrder(async () => {
       for (const contact of contacts) await this.#onContact(contact);
     });
+  }
+
+  /**
+   * The chat list WhatsApp sends right after linking. Entries with a saved
+   * name are the user's own contacts; a 1:1 chat with no name is someone they
+   * talk to but never saved: a backfill candidate.
+   */
+  onHistory(contacts: IncomingContact[]): Promise<void> {
+    return this.#inOrder(async () => {
+      for (const contact of contacts) {
+        if (contact.name?.trim()) {
+          await this.#onContact(contact);
+          continue;
+        }
+        const phone = await this.#phoneOf(contact);
+        if (!phone) continue;
+        if (contact.notify) {
+          // A push-name entry. These cover group members too, so on its own it
+          // is not a candidate; it only names one.
+          this.#pushNames.set(phone, contact.notify);
+          const candidate = this.#candidates.get(phone);
+          if (candidate && !candidate.pushName) {
+            candidate.pushName = contact.notify;
+            await this.store.updateContact(this.userId, phone, { push_name: contact.notify });
+          }
+          continue;
+        }
+        if (!contact.id || isIgnoredChat(contact.id)) continue;
+        if (this.#known.has(phone) || this.#candidates.has(phone) || this.#queued.has(phone)) continue;
+        const sock = this.getSock();
+        if (sock?.user?.id && userPart(sock.user.id) === phone) continue;
+        const lid = isLidJid(contact.lid) ? contact.lid : isLidJid(contact.id) ? contact.id : null;
+        const pushName = this.#pushNames.get(phone) ?? null;
+        this.#candidates.set(phone, { pushName, lid });
+        await this.store.insertContact(this.userId, { phone, lid, push_name: pushName, status: 'pending' });
+      }
+    });
+  }
+
+  /** Queue every backfill candidate. Returns how many were queued. */
+  async backfill(): Promise<number> {
+    const policy = await this.policy.get(this.userId);
+    let queued = 0;
+    for (const [phone, candidate] of this.#candidates) {
+      if (this.#known.has(phone) || this.#queued.has(phone)) continue;
+      this.#queued.add(phone);
+      this.#jobs.push({
+        phone,
+        update: true,
+        lid: candidate.lid,
+        pushName: candidate.pushName,
+        name: buildName(candidate.pushName, phone, policy.settings),
+      });
+      queued += 1;
+    }
+    void this.#run();
+    return queued;
+  }
+
+  /** Try a failed contact again, because the user asked. False if there is nothing to retry. */
+  async retry(phone: string): Promise<boolean> {
+    const row = await this.store.getContact(this.userId, phone);
+    if (!row || row.status !== 'failed' || this.#queued.has(phone)) return false;
+    const policy = await this.policy.get(this.userId);
+    this.#queued.add(phone);
+    this.#jobs.push({
+      phone,
+      update: true,
+      force: true,
+      lid: row.lid,
+      pushName: row.push_name,
+      name: buildName(row.push_name, phone, policy.settings),
+    });
+    void this.#run();
+    return true;
+  }
+
+  async #phoneOf(contact: IncomingContact): Promise<string> {
+    let pnJid: string | null = null;
+    if (isPnJid(contact.id)) pnJid = contact.id;
+    else if (isPnJid(contact.phoneNumber)) pnJid = contact.phoneNumber;
+    else {
+      const lid = isLidJid(contact.id) ? contact.id : contact.lid;
+      if (isLidJid(lid)) {
+        pnJid = (await this.getSock()?.signalRepository.lidMapping.getPNForLID(lid).catch(() => null)) ?? null;
+      }
+    }
+    return pnJid ? userPart(pnJid) : '';
   }
 
   async #onMessage(message: IncomingMessage): Promise<void> {
@@ -159,6 +258,8 @@ export class ContactSaver {
     this.#queued.add(phone);
     this.#jobs.push({
       phone,
+      // A backfill candidate who messages gets saved now; their row already exists.
+      update: this.#candidates.has(phone),
       lid,
       pushName: message.pushName ?? null,
       name: buildName(message.pushName, phone, policy.settings),
@@ -174,19 +275,15 @@ export class ContactSaver {
     const name = contact.name?.trim();
     if (!name) return;
 
-    let pnJid: string | null = null;
-    if (isPnJid(contact.id)) pnJid = contact.id;
-    else if (isPnJid(contact.phoneNumber)) pnJid = contact.phoneNumber;
-    else {
-      const lid = isLidJid(contact.id) ? contact.id : contact.lid;
-      if (isLidJid(lid)) {
-        pnJid = (await this.getSock()?.signalRepository.lidMapping.getPNForLID(lid).catch(() => null)) ?? null;
-      }
-    }
-    const phone = pnJid ? userPart(pnJid) : '';
+    const phone = await this.#phoneOf(contact);
     if (!phone || this.#known.has(phone)) return;
 
     this.#known.add(phone);
+    if (this.#candidates.delete(phone)) {
+      // A backfill candidate the user has since saved by hand.
+      await this.store.updateContact(this.userId, phone, { status: 'existing', saved_name: name });
+      return;
+    }
     await this.store.insertContact(this.userId, {
       phone,
       lid: isLidJid(contact.lid) ? contact.lid : isLidJid(contact.id) ? contact.id : null,
@@ -222,10 +319,11 @@ export class ContactSaver {
 
         this.#queued.delete(job.phone);
         // Switched off, unsubscribed, or saved by hand while it waited.
-        if (!policy.settings.enabled || !policy.subscribed || this.#known.has(job.phone)) continue;
+        const done = this.#known.has(job.phone) && !job.force;
+        if (!policy.settings.enabled || !policy.subscribed || done) continue;
 
         await this.#pause();
-        if (this.#known.has(job.phone)) continue;
+        if (this.#known.has(job.phone) && !job.force) continue;
         // Claimed before the call, so the contact event WhatsApp echoes back
         // for our own save is not mistaken for one the user made by hand.
         this.#known.add(job.phone);
@@ -267,14 +365,17 @@ export class ContactSaver {
     }
 
     if (!failure) this.#savedToday += 1;
-    await this.store.insertContact(this.userId, {
+    const row = {
       phone: job.phone,
       lid: job.lid,
       push_name: job.pushName,
       saved_name: job.name,
-      status: failure ? 'failed' : 'saved',
+      status: failure ? ('failed' as const) : ('saved' as const),
       error: failure || null,
-    });
+    };
+    this.#candidates.delete(job.phone);
+    if (job.update) await this.store.updateContact(this.userId, job.phone, row);
+    else await this.store.insertContact(this.userId, row);
     log.info(failure ? 'contact save failed' : 'contact saved', {
       userId: this.userId,
       phone: maskPhone(job.phone),

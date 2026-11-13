@@ -38,7 +38,7 @@ export interface SavedContact {
   phone: string;
   push_name: string | null;
   saved_name: string | null;
-  status: 'saved' | 'existing' | 'failed' | 'unresolved';
+  status: 'saved' | 'existing' | 'failed' | 'unresolved' | 'pending';
   error: string | null;
   created_at: string;
 }
