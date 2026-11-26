@@ -68,7 +68,14 @@ test('/config.js gives the browser the Supabase settings and nothing else', asyn
   assert.deepEqual(JSON.parse(match[1]!), {
     supabaseUrl: 'https://project.supabase.co',
     supabaseAnonKey: 'anon-key-123',
+    billing: true,
   });
+});
+
+test('/config.js tells the dashboard when billing is off', async () => {
+  const get = serve({ billingEnabled: false });
+  const body = await (await get('/config.js')).text();
+  assert.equal(JSON.parse(/= (.*);$/.exec(body)![1]!).billing, false);
 });
 
 test('/config.js cannot be made to close a script context', async () => {

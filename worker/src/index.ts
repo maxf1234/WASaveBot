@@ -1,10 +1,11 @@
 import Stripe from 'stripe';
 import { createApp } from './app.js';
 import { createTokenVerifier } from './auth.js';
-import { Billing } from './billing.js';
+import { Billing, noBilling } from './billing.js';
+import type { BillingApi } from './billing.js';
 import { keyRing, parseKey } from './crypto.js';
 import { createMailer } from './email.js';
-import { loadEnv } from './env.js';
+import { billingConfigured, loadEnv } from './env.js';
 import { errorMessage, log } from './log.js';
 import { Maintenance } from './maintenance.js';
 import { SessionManager } from './sessions.js';
@@ -47,9 +48,17 @@ if (env.waAuthEncryptionKeyPrevious) {
     'Remove it once every session has reconnected, so the old key stops being accepted.');
 }
 
-const stripe = new Stripe(env.stripeSecretKey);
-const billing = new Billing(stripe, store, policy, { nudge: () => sessions.nudge() }, {
-  priceId: env.stripePriceId,
+// Stripe is optional. Without it nobody can subscribe, every account stays in
+// the free preview, and the rest of the product works exactly as before.
+const billingEnabled = billingConfigured(env);
+const stripe = billingEnabled ? new Stripe(env.stripeSecretKey!) : undefined;
+if (!billingEnabled) {
+  log.warn('Stripe is not configured: billing is off and every account stays in the free preview');
+} else if (!env.stripeWebhookSecret) {
+  log.warn('STRIPE_WEBHOOK_SECRET is not set: subscriptions will not update until it is');
+}
+const billing: BillingApi = !stripe ? noBilling : new Billing(stripe, store, policy, { nudge: () => sessions.nudge() }, {
+  priceId: env.stripePriceId!,
   trialDays: env.trialDays,
   webUrl: env.webUrl,
   graceHours: env.paymentGraceHours,
@@ -75,8 +84,11 @@ const app = createApp({
   webRoot: env.webRoot,
   adminEmails: env.adminEmails,
   verifyToken: createTokenVerifier(env.supabaseUrl, env.supabaseJwtSecret),
-  constructEvent: (body, signature) =>
-    stripe.webhooks.constructEvent(body, signature, env.stripeWebhookSecret),
+  constructEvent:
+    stripe && env.stripeWebhookSecret
+      ? (body, signature) => stripe.webhooks.constructEvent(body, signature, env.stripeWebhookSecret!)
+      : undefined,
+  billingEnabled,
   store,
   billing,
   sessions: { count: () => sessions.count(), nudge: () => sessions.nudge() },

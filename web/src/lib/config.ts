@@ -15,6 +15,8 @@
 interface RuntimeConfig {
   supabaseUrl?: string;
   supabaseAnonKey?: string;
+  /** False when the worker has no Stripe keys yet. */
+  billing?: boolean;
 }
 
 const runtime: RuntimeConfig =
@@ -24,6 +26,9 @@ const env = import.meta.env as Record<string, string | undefined>;
 
 export const supabaseUrl = runtime.supabaseUrl || env.VITE_SUPABASE_URL || '';
 export const supabaseAnonKey = runtime.supabaseAnonKey || env.VITE_SUPABASE_ANON_KEY || '';
+
+/** Whether subscribing is possible. Defaults to on, as an older worker would not say. */
+export const billingEnabled = runtime.billing !== false;
 
 /** Empty means "same origin as this page", which is the normal case. */
 export const apiUrl = (env.VITE_API_URL ?? '').replace(/\/+$/, '');

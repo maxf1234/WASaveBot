@@ -46,7 +46,9 @@ The web app reads its own rows straight from Supabase under RLS. Anything touchi
 3. Authentication → Providers: Email on. For quick testing turn "Confirm email" off; with it on, set Authentication → URL Configuration → Site URL to the Railway URL.
 4. Collect: Project URL, anon key, service-role key, JWT secret (Settings → API). The worker needs all four.
 
-### 2. Stripe (test mode)
+### 2. Stripe (test mode, optional)
+
+You can skip this step and come back to it. Without Stripe keys the worker runs with billing off: everyone stays in the free preview, the Billing page says billing isn't set up yet, and the webhook answers 503 so Stripe retries once you add it. Placeholder values count as unset; a value only counts with Stripe's real prefix (`sk_`/`rk_`, `whsec_`, `price_`).
 
 1. Create a product with a monthly recurring price of $9.99. Copy the price ID (`price_...`).
 2. Settings → Billing → Customer portal: activate it and allow cancelling subscriptions.
