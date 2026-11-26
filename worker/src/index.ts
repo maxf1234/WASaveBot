@@ -64,8 +64,15 @@ if (env.adminEmails.length === 0) {
   log.info('ADMIN_EMAILS is not set: the admin page is closed to everyone');
 }
 
+if (env.webRoot && !env.supabaseAnonKey) {
+  log.warn('SUPABASE_ANON_KEY is not set: the dashboard will load but say it is not set up');
+}
+
 const app = createApp({
   webUrl: env.webUrl,
+  supabaseUrl: env.supabaseUrl,
+  supabaseAnonKey: env.supabaseAnonKey,
+  webRoot: env.webRoot,
   adminEmails: env.adminEmails,
   verifyToken: createTokenVerifier(env.supabaseUrl, env.supabaseJwtSecret),
   constructEvent: (body, signature) =>

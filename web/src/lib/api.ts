@@ -1,6 +1,5 @@
+import { apiUrl as base } from './config';
 import { supabase } from './supabase';
-
-const base = ((import.meta.env.VITE_API_URL as string | undefined) ?? '').replace(/\/+$/, '');
 
 /** POST to the worker with the user's Supabase JWT. Throws with the worker's message. */
 export async function api<T = { ok: true }>(path: string, body?: object): Promise<T> {

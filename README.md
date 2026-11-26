@@ -17,7 +17,6 @@ Who counts as "new people" is theirs to choose: everyone who messages, or only t
 | AES-256-GCM encryption of the stored WhatsApp login keys | `contact-saver`, `api/src/lib/crypto.ts` (same idea, key in `WA_AUTH_ENCRYPTION_KEY`) |
 | Phone masking in logs | `contact-saver`, `api/src/lib/logging.ts` |
 | The trigger parser and its name handling, the prefix matcher, the pure decision, the watch-only catch and the activity log | `contact-saver`, `api/src/domain/` |
-| Vercel SPA rewrite in `vercel.json` | `affiliate-2.0` |
 
 Where those repos differ from the build document, the document won: Supabase instead of a direct Postgres connection, Express instead of Fastify, the Stripe SDK instead of hand-rolled `fetch`, `baileys@7.0.0-rc14` instead of `@whiskeysockets/baileys@6.x`. None of my repos used Supabase, so the Supabase client setup is new. One later change overrides the document: linking uses a pairing code, not a QR code, so `wa_sessions` has `pairing_code` and status `pairing` where the document had `qr`.
 
@@ -25,7 +24,7 @@ Where those repos differ from the build document, the document won: Supabase ins
 
 ```
 worker/     Node + TypeScript + Express + Baileys. One always-on Railway instance.
-web/        React + Vite + TypeScript + Tailwind. Deployed on Vercel.
+web/        React + Vite + TypeScript + Tailwind. Built into the worker's image and served by it.
 supabase/   The migrations, and an RLS test that runs on a throwaway Postgres.
 ```
 
@@ -36,7 +35,7 @@ the verdict and writes down what happened. That split is what makes the
 product's riskiest property — an unarmed account never writes to an address
 book — provable over every combination of settings rather than hoped for.
 
-The web app reads its own rows straight from Supabase under RLS. Anything touching WhatsApp or Stripe goes through the worker with the user's Supabase JWT.
+The web app reads its own rows straight from Supabase under RLS. Anything touching WhatsApp or Stripe goes through the worker with the user's Supabase JWT. Both are served from the same Railway service and the same origin.
 
 ## Setup
 
@@ -44,8 +43,8 @@ The web app reads its own rows straight from Supabase under RLS. Anything touchi
 
 1. Create a project.
 2. SQL Editor: run every file in `supabase/migrations/` in order (or `supabase db push` with the CLI).
-3. Authentication → Providers: Email on. For quick testing turn "Confirm email" off; with it on, set Authentication → URL Configuration → Site URL to the Vercel URL.
-4. Collect: Project URL, anon key, service-role key, JWT secret (Settings → API).
+3. Authentication → Providers: Email on. For quick testing turn "Confirm email" off; with it on, set Authentication → URL Configuration → Site URL to the Railway URL.
+4. Collect: Project URL, anon key, service-role key, JWT secret (Settings → API). The worker needs all four.
 
 ### 2. Stripe (test mode)
 
@@ -60,10 +59,13 @@ cd worker && cp .env.example .env && npm install && npm run dev
 ```
 
 ```bash
-cd web && cp .env.example .env && npm install && npm run dev
+cd web && npm install && npm run dev
 ```
 
-Fill in both `.env` files first. Locally, `WEB_URL=http://localhost:5173` and `VITE_API_URL=http://localhost:3000`. To receive webhooks locally:
+Fill in `worker/.env` first, with `WEB_URL=http://localhost:5173`. The site needs
+no `.env` of its own: Vite proxies `/api` and `/config.js` to the worker on port
+3000, so it is the same origin in development exactly as it is in production.
+To receive webhooks locally:
 
 ```bash
 stripe listen --forward-to localhost:3000/api/stripe/webhook
@@ -71,24 +73,34 @@ stripe listen --forward-to localhost:3000/api/stripe/webhook
 
 ## Deploy
 
-### Worker on Railway
+**One Railway service runs the whole product.** The dashboard is built into the
+same image as the worker and served by it, so there is one deploy and one URL,
+and no second host to keep in step. The root `Dockerfile` builds both.
 
-1. New project → Deploy from GitHub repo → this repo. In the service settings set **Root Directory** to `worker`. `railway.json` and the `Dockerfile` do the rest.
-2. Add the variables from `worker/.env.example`. `WEB_URL` is the Vercel URL with no trailing slash. Leave `PORT` unset; Railway provides it.
+1. New project → **Deploy from GitHub repo** → this repo. Leave **Root
+   Directory** empty: the build needs both `web/` and `worker/`. Set the
+   **Branch** to `main`. `railway.json` does the rest.
+2. **Settings → Networking → Generate Domain.** `WEB_URL` defaults to this
+   domain, so you do not need to set it — only if you later add a custom domain.
+3. Add the variables from `worker/.env.example`, plus `SUPABASE_ANON_KEY`. Leave
+   `PORT` unset; Railway provides it.
+   - `SUPABASE_ANON_KEY` is not a secret — it is in every browser that opens the
+     site, and RLS is what protects the data — but the worker hands it to the
+     dashboard at load time through `/config.js`, so it lives here. Nothing is
+     baked into the build, so changing a key is a variable and a restart.
    - `WA_AUTH_ENCRYPTION_KEY` is required. Generate it once and keep a copy somewhere safe; if it is lost, every customer has to link WhatsApp again. It can now be *rotated* without that — see the key rotation note under Behaviour worth knowing.
 
      ```bash
      node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
      ```
    - `RESEND_API_KEY` and `EMAIL_FROM` are optional. With both set, a customer is emailed when WhatsApp logs them out. `EMAIL_FROM` must be on a domain verified at resend.com. Without them the worker runs normally and sends no email.
-3. Keep `numReplicas` at **1** — see [Scaling past one worker](#scaling-past-one-worker) for how to run more than one.
-4. Generate a public domain. `GET /health` returns `{"ok":true,"sockets":N}`.
+4. Keep `numReplicas` at **1** — see [Scaling past one worker](#scaling-past-one-worker) for how to run more than one.
+5. Open the domain. `/` is the dashboard and `/health` returns `{"ok":true,"sockets":N}`.
 
-### Web on Vercel
-
-1. New project → import this repo → **Root Directory** `web` (framework: Vite).
-2. Add the variables from `web/.env.example`. `VITE_API_URL` is the Railway URL.
-3. Deploy, then put the final Vercel URL into the worker's `WEB_URL` and Supabase's Site URL.
+The site can still be hosted elsewhere if you ever want to: build `web/`, point
+it at the worker with `VITE_API_URL`, `VITE_SUPABASE_URL` and
+`VITE_SUPABASE_ANON_KEY`, and set the worker's `WEB_URL` to its address so CORS
+allows it.
 
 ## Scaling past one worker
 

@@ -1,5 +1,7 @@
 /** The worker's HTTP API. Everything except the Stripe webhook and /health needs a Supabase JWT. */
 
+import { existsSync } from 'node:fs';
+import { join, sep } from 'node:path';
 import cors from 'cors';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
@@ -13,6 +15,11 @@ import type { Store } from './store.js';
 
 export interface AppDeps {
   webUrl: string;
+  /** Served to the dashboard at load time via /config.js. */
+  supabaseUrl?: string;
+  supabaseAnonKey?: string;
+  /** The built dashboard. When it exists the worker serves the whole product from one origin. */
+  webRoot?: string;
   /** Lower-cased emails allowed to see the admin page. Empty means nobody. */
   adminEmails?: string[];
   verifyToken: TokenVerifier;
@@ -238,6 +245,45 @@ export function createApp(deps: AppDeps): express.Express {
       res.json({ ok: true });
     }),
   );
+
+  // ---------------------------------------------------------------- the site
+  //
+  // The dashboard ships inside this service: one deploy, one URL, and no
+  // separate host to keep in step. Everything under /api stays an API, and
+  // every other path that is not a file falls back to index.html, because the
+  // dashboard routes in the browser.
+
+  app.get('/config.js', (_req, res) => {
+    const config = { supabaseUrl: deps.supabaseUrl ?? '', supabaseAnonKey: deps.supabaseAnonKey ?? '' };
+    // `<` escaped so nothing in a value could ever close a script context.
+    const body = `window.__SAVEBOT__ = ${JSON.stringify(config).replace(/</g, '\\u003c')};`;
+    res
+      .type('application/javascript')
+      // Read on every load: a changed key must not be served stale from a cache.
+      .set('Cache-Control', 'no-store')
+      .send(body);
+  });
+
+  const webRoot = deps.webRoot && existsSync(join(deps.webRoot, 'index.html')) ? deps.webRoot : undefined;
+  if (webRoot) {
+    // Hashed asset filenames change on every build, so they can be cached for
+    // ever; index.html cannot, or a deploy would not reach anybody.
+    app.use(
+      express.static(webRoot, {
+        index: false,
+        setHeaders: (res, path) => {
+          res.setHeader(
+            'Cache-Control',
+            path.includes(`${sep}assets${sep}`) ? 'public, max-age=31536000, immutable' : 'no-cache',
+          );
+        },
+      }),
+    );
+    app.use((req, res, next) => {
+      if (req.method !== 'GET' || req.path.startsWith('/api/')) return next();
+      res.set('Cache-Control', 'no-cache').sendFile(join(webRoot, 'index.html'));
+    });
+  }
 
   app.use((_req, res) => {
     res.status(404).json({ error: 'Not found' });
