@@ -40,7 +40,7 @@ function fakeStripe() {
   return { state, api: api as unknown as Stripe };
 }
 
-function setup(trialDays = 7) {
+function setup(trialDays = 7, adminEmails: string[] = []) {
   const store = new MemoryStore();
   store.addUser(USER, 'none');
   store.addUser('other', 'none');
@@ -62,12 +62,14 @@ function setup(trialDays = 7) {
     webUrl: WEB,
     verifyToken: async (token) => {
       if (!token.startsWith('good:')) throw new Error('bad');
-      return { id: token.slice(5), email: null };
+      const id = token.slice(5);
+      return { id, email: `${id}@example.com` };
     },
     constructEvent: (body, sig) => stripeSdk.webhooks.constructEvent(body, sig, SECRET),
     store,
     billing,
     sessions,
+    adminEmails,
   });
   const server = app.listen(0);
   after(() => server.close());
@@ -246,4 +248,85 @@ test('backfill and retry need a JWT and a connected WhatsApp', async () => {
   assert.equal((await post('/api/contacts/retry', `good:${USER}`, { phone: "1; drop" })).status, 400);
   assert.equal((await post('/api/contacts/retry', `good:${USER}`)).status, 400);
   assert.deepEqual(calls, ['retry:15551230001', 'retry:15559999999']);
+});
+
+
+// ---------------------------------------------------------------- admin
+
+test('the admin page is closed to everyone when no admins are configured', async () => {
+  // Fails closed: an admin page open by accident is worse than none at all.
+  const { post } = setup(7, []);
+  assert.equal((await post('/api/admin/overview', `good:${USER}`)).status, 403);
+  assert.deepEqual(await (await post('/api/admin/check', `good:${USER}`)).json(), { admin: false });
+});
+
+test('a customer who is not an admin is refused the overview', async () => {
+  const { post } = setup(7, ['boss@example.com']);
+  assert.equal((await post('/api/admin/overview', `good:${USER}`)).status, 403);
+  assert.deepEqual(await (await post('/api/admin/check', `good:${USER}`)).json(), { admin: false });
+});
+
+test('an admin sees every customer and the totals', async () => {
+  const { post, store } = setup(7, ['boss@example.com']);
+  store.addUser('boss', 'active');
+  store.profiles.get('boss')!.email = 'boss@example.com';
+  store.profiles.get(USER)!.subscription_status = 'active';
+  await store.claimContact(USER, { phone: '15550000001', status: 'saved' });
+  await store.claimContact(USER, { phone: '15550000002', status: 'failed' });
+
+  assert.deepEqual(await (await post('/api/admin/check', 'good:boss')).json(), { admin: true });
+
+  const res = await post('/api/admin/overview', 'good:boss');
+  assert.equal(res.status, 200);
+  const overview = (await res.json()) as {
+    customers: { user_id: string; saved_count: number; failed_count: number }[];
+    totals: { customers: number; subscribed: number; saved: number; failed: number };
+    sockets: number;
+  };
+  assert.equal(overview.totals.customers, 3, 'every customer, not just their own row');
+  assert.equal(overview.totals.saved, 1);
+  assert.equal(overview.totals.failed, 1);
+  assert.equal(overview.sockets, 3, 'and the live socket count');
+  assert.ok(overview.customers.some((c) => c.user_id === USER));
+});
+
+test('the admin email match ignores case and surrounding space', async () => {
+  const { post } = setup(7, ['  BOSS@Example.com ']);
+  assert.deepEqual(await (await post('/api/admin/check', 'good:boss')).json(), { admin: true });
+});
+
+test('a verified token with no email is never an admin', async () => {
+  // Some Supabase providers can leave the claim out; the check must not then
+  // match an empty configured entry.
+  const store = new MemoryStore();
+  store.addUser(USER, 'active');
+  const app = createApp({
+    webUrl: WEB,
+    verifyToken: async () => ({ id: USER, email: null }),
+    constructEvent: () => {
+      throw new Error('unused');
+    },
+    store,
+    billing: {
+      checkoutUrl: async () => 'x',
+      portalUrl: async () => 'x',
+      cancelAll: async () => {},
+      handleEvent: async () => {},
+    },
+    sessions: {
+      count: () => 0,
+      start: async () => {},
+      logout: async () => {},
+      connectedSaver: () => undefined,
+    },
+    adminEmails: ['', 'boss@example.com'],
+  });
+  const server = app.listen(0);
+  after(() => server.close());
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const res = await fetch(`${base}/api/admin/check`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer good:x' },
+  });
+  assert.deepEqual(await res.json(), { admin: false });
 });

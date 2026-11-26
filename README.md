@@ -199,6 +199,35 @@ activity stay, so subscribing later picks up where they left off. It defaults to
 0, meaning no limit, because an expiring preview is a worse demonstration; raise
 it off zero when free sockets start to cost more than they earn.
 
+## The admin page
+
+`ADMIN_EMAILS` (comma separated) decides who sees `/admin`. It is matched
+against the email in the verified Supabase JWT, so it is not something a
+browser can assert about itself, and it is empty by default: with nothing
+configured, nobody is an admin.
+
+The page exists because the per-customer failures are otherwise invisible. It
+leads with the cases worth acting on, worst first:
+
+- **paying, not connected** — being charged for nothing
+- **paying, not armed** — paid, then never switched it on
+- **payment failing** — inside the grace window, about to stop
+- **logged out of WhatsApp** — needs to re-link and does not know it
+
+None of those produces an event anybody sees. It also shows how many WhatsApp
+sockets this worker is holding, which is the number that matters for the
+single-replica ceiling.
+
+This is the only page that reads across tenants, so it does not go through
+Supabase like the rest of the dashboard — RLS would correctly return one row. It
+goes through the worker, which holds the service-role key. The aggregation is a
+view, `admin_overview`, and the view is locked down twice over: `revoke` so
+`authenticated` cannot read it at all, and `security_invoker = true` so the
+underlying policies would still apply if the grants were ever loosened. A view
+in Postgres runs with its owner's rights by default, which would have been a way
+straight past every policy in `0002`. `supabase/tests/rls.sql` checks a customer
+is refused and the worker is not.
+
 ## Behaviour worth knowing
 
 - **Save modes**: `everyone` saves each new person who messages privately, which is what every existing account does. `phrase` saves only people whose message *starts with* the customer's phrase — anchored deliberately, because "don't save my number" and "did you save my number?" both contain it and neither is a request. In phrase mode the name the sender gives beats their WhatsApp name, and politeness is stripped, so "save my number please" does not file a contact called "please".

@@ -3,6 +3,7 @@ import { Layout } from './components/Layout';
 import { AuthProvider, useAuth } from './lib/auth';
 import { configured } from './lib/supabase';
 import { Activity } from './pages/Activity';
+import { Admin } from './pages/Admin';
 import { Billing } from './pages/Billing';
 import { Dashboard } from './pages/Dashboard';
 import { Privacy, Terms } from './pages/Legal';
@@ -43,6 +44,9 @@ export function App() {
             <Route path="/rules" element={<Rules />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/billing" element={<Billing />} />
+            {/* The worker refuses this to anyone not in ADMIN_EMAILS, so the
+                route being reachable is not the gate; the server is. */}
+            <Route path="/admin" element={<Admin />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Route>

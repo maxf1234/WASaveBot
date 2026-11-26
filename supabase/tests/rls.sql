@@ -85,6 +85,12 @@ begin
   assert pg_temp.denied($q$insert into save_events (user_id, phone, decision)
     values ('00000000-0000-0000-0000-00000000000a','1','saved')$q$), 'events cannot be forged';
 
+  -- The admin view reads across every tenant, so a customer must not reach it.
+  -- A view runs with its owner's rights by default, which would be a way
+  -- straight past the policies above; the migration both revokes it and sets
+  -- security_invoker, and this is the check that neither was lost.
+  assert pg_temp.denied('select * from admin_overview'), 'admin_overview is unreadable by a customer';
+
   -- The dial plan is shared reference data, readable by anyone signed in.
   assert (select count(*) from dial_prefixes) > 200, 'the dial plan is readable';
   assert pg_temp.denied($q$insert into dial_prefixes values ('999','country','Nowhere','XX')$q$),
@@ -132,6 +138,16 @@ do $$ begin
             from pg_publication_tables where pubname = 'supabase_realtime')
          = array['save_events', 'saved_contacts', 'wa_sessions'], 'the three Realtime tables';
 end $$;
+
+-- The worker's role is the one that may read it, and it sees every customer.
+set role service_role;
+do $$ begin
+  assert (select count(*) from admin_overview) = 2, 'the worker sees both customers';
+  assert (select saved_count from admin_overview
+           where user_id = '00000000-0000-0000-0000-00000000000a') = 1,
+    'and the per-customer counts are aggregated';
+end $$;
+reset role;
 
 -- Deleting the auth user takes everything with it.
 delete from auth.users where id = '00000000-0000-0000-0000-00000000000a';

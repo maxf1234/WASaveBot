@@ -105,6 +105,26 @@ export interface RuleRow {
   created_at: string;
 }
 
+/** One customer, as the admin page shows them. */
+export interface AdminRow {
+  user_id: string;
+  email: string | null;
+  subscription_status: string;
+  grace_until: string | null;
+  created_at: string;
+  session_status: string | null;
+  session_phone: string | null;
+  last_connected_at: string | null;
+  armed: boolean | null;
+  enabled: boolean | null;
+  save_mode: string | null;
+  saved_count: number;
+  failed_count: number;
+  pending_count: number;
+  removed_count: number;
+  last_event_at: string | null;
+}
+
 /** One row of the activity log. Never carries message content. */
 export interface SaveEvent {
   phone: string | null;
@@ -151,6 +171,8 @@ export interface Store {
   usersWithLapsedGrace(): Promise<string[]>;
   /** Nightly sweep. Returns how many rows went. */
   purgeEvents(retentionDays: number): Promise<number>;
+  /** One row per customer, for the operator's admin page. */
+  adminOverview(limit: number): Promise<AdminRow[]>;
   deleteUser(userId: string): Promise<void>;
 
   // save_events
@@ -422,6 +444,19 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
         'purge events',
       );
       return rows?.length ?? 0;
+    },
+
+    async adminOverview(limit) {
+      return (check(
+        await db
+          .from('admin_overview')
+          .select('*')
+          // Newest signups first: the interesting customer is usually the
+          // one who just arrived and cannot get something working.
+          .order('created_at', { ascending: false })
+          .limit(limit),
+        'read admin overview',
+      ) ?? []) as AdminRow[];
     },
 
     async deleteUser(userId) {

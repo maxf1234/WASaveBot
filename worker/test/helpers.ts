@@ -182,6 +182,33 @@ export class MemoryStore implements Store {
     }
     return removed;
   }
+  async adminOverview(limit: number) {
+    return [...this.profiles.values()].slice(0, limit).map((p) => {
+      const rows = this.rows(p.id);
+      const count = (status: string) => rows.filter((r) => r.status === status).length;
+      const settings = this.settings.get(p.id);
+      const session = this.sessions.get(p.id);
+      return {
+        user_id: p.id,
+        email: p.email,
+        subscription_status: p.subscription_status,
+        grace_until: p.grace_until ?? null,
+        created_at: this.createdAt.get(p.id) ?? new Date().toISOString(),
+        session_status: session?.status ?? null,
+        session_phone: session?.phone ?? null,
+        last_connected_at: session?.last_connected_at ?? null,
+        armed: settings?.armed ?? null,
+        enabled: settings?.enabled ?? null,
+        save_mode: settings?.save_mode ?? null,
+        saved_count: count('saved'),
+        failed_count: count('failed'),
+        pending_count: count('pending'),
+        removed_count: count('removed'),
+        last_event_at: this.eventRows(p.id).at(-1)?.occurred_at ?? null,
+      };
+    });
+  }
+
   async deleteUser(userId: string) {
     this.deletedUsers.push(userId);
     this.profiles.delete(userId);

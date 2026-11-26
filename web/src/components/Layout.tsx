@@ -1,5 +1,7 @@
+import { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet } from 'react-router-dom';
 import { APP_NAME } from '../brand';
+import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { supabase } from '../lib/supabase';
 
@@ -19,6 +21,18 @@ export function Footer() {
 
 export function Layout() {
   const { user } = useAuth();
+  // Asks the worker rather than deciding here: the browser must not be told
+  // who the admins are, and could not be trusted with the answer anyway.
+  const [admin, setAdmin] = useState(false);
+  useEffect(() => {
+    if (!user) {
+      setAdmin(false);
+      return;
+    }
+    api<{ admin: boolean }>('/api/admin/check')
+      .then((r) => setAdmin(r.admin))
+      .catch(() => setAdmin(false));
+  }, [user]);
   const tab = ({ isActive }: { isActive: boolean }) =>
     `rounded-lg px-3 py-2 text-sm font-medium ${isActive ? 'bg-accent/10 text-accent-dark' : 'text-slate-600 hover:bg-slate-100'}`;
   return (
@@ -45,6 +59,11 @@ export function Layout() {
               <NavLink to="/billing" className={tab}>
                 Billing
               </NavLink>
+              {admin && (
+                <NavLink to="/admin" className={tab}>
+                  Admin
+                </NavLink>
+              )}
               <button
                 type="button"
                 onClick={() => void supabase.auth.signOut()}

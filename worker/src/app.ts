@@ -8,10 +8,13 @@ import type { AuthedUser, TokenVerifier } from './auth.js';
 import { HttpError } from './billing.js';
 import type { Billing } from './billing.js';
 import { errorMessage, log } from './log.js';
+import { maySave } from './store.js';
 import type { Store } from './store.js';
 
 export interface AppDeps {
   webUrl: string;
+  /** Lower-cased emails allowed to see the admin page. Empty means nobody. */
+  adminEmails?: string[];
   verifyToken: TokenVerifier;
   /** Verifies the signature and parses the event; throws if it is not from Stripe. */
   constructEvent: (rawBody: Buffer, signature: string) => Stripe.Event;
@@ -56,6 +59,11 @@ export function createApp(deps: AppDeps): express.Express {
   });
 
   app.use(express.json({ limit: '100kb' }));
+
+  const admins = new Set((deps.adminEmails ?? []).map((email) => email.trim().toLowerCase()));
+  // Fails closed: with no ADMIN_EMAILS configured, nobody is an admin.
+  const isAdmin = (user: AuthedUser): boolean =>
+    Boolean(user.email) && admins.has(user.email!.trim().toLowerCase());
 
   const authed = (handler: Handler) => async (req: Request, res: Response, next: NextFunction) => {
     const token = /^Bearer (.+)$/i.exec(req.headers.authorization ?? '')?.[1];
@@ -126,6 +134,45 @@ export function createApp(deps: AppDeps): express.Express {
       if (!saver) throw new HttpError(409, 'Connect WhatsApp first');
       if (!(await saver.retry(phone))) throw new HttpError(404, 'Nothing to retry for that contact');
       res.json({ ok: true });
+    }),
+  );
+
+  /**
+   * Is the signed-in user an operator?
+   *
+   * Answers 200 with a boolean rather than 403, because the dashboard calls it
+   * on every page load just to decide whether to show a nav link, and a 403 on
+   * an ordinary customer's normal navigation is noise in the logs that looks
+   * like an attack. The real refusal is on the overview below.
+   */
+  app.post(
+    '/api/admin/check',
+    authed(async (_req, res, user) => {
+      res.json({ admin: isAdmin(user) });
+    }),
+  );
+
+  app.post(
+    '/api/admin/overview',
+    authed(async (req, res, user) => {
+      // Checked against the email in the verified Supabase JWT, so this is not
+      // something a client can assert about itself.
+      if (!isAdmin(user)) throw new HttpError(403, 'Not an admin');
+      const raw = (req.body as { limit?: unknown } | undefined)?.limit;
+      const limit = Math.min(Math.max(Number(raw) || 200, 1), 1000);
+      const customers = await deps.store.adminOverview(limit);
+      res.json({
+        customers,
+        totals: {
+          customers: customers.length,
+          subscribed: customers.filter((c) => maySave(c.subscription_status, c.grace_until)).length,
+          connected: customers.filter((c) => c.session_status === 'connected').length,
+          armed: customers.filter((c) => c.armed === true).length,
+          saved: customers.reduce((sum, c) => sum + c.saved_count, 0),
+          failed: customers.reduce((sum, c) => sum + c.failed_count, 0),
+        },
+        sockets: deps.sessions.count(),
+      });
     }),
   );
 

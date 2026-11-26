@@ -58,6 +58,12 @@ export interface Env {
   resendApiKey?: string;
   emailFrom?: string;
   appName: string;
+  /**
+   * Who may see the admin page, as email addresses. Empty means nobody, which
+   * is the right default: an admin page that is open by accident is worse than
+   * no admin page.
+   */
+  adminEmails: string[];
 }
 
 export function loadEnv(): Env {
@@ -81,5 +87,9 @@ export function loadEnv(): Env {
     resendApiKey: process.env.RESEND_API_KEY?.trim() || undefined,
     emailFrom: process.env.EMAIL_FROM?.trim() || undefined,
     appName: process.env.APP_NAME?.trim() || 'SaveBot',
+    adminEmails: (process.env.ADMIN_EMAILS ?? '')
+      .split(',')
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean),
   };
 }
