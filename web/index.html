@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SaveBot</title>
+    <!-- Served by the worker: the Supabase settings, read at load time rather
+         than baked into the build. First in <head>, as a plain blocking script,
+         so it has run before the app module — which is deferred — starts. -->
+    <script src="/config.js"></script>
   </head>
   <body>
     <div id="root"></div>

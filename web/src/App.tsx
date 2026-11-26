@@ -27,7 +27,7 @@ export function App() {
   if (!configured) {
     return (
       <p className="mx-auto max-w-md p-6 text-slate-700">
-        This site is not set up yet: VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY and VITE_API_URL must be set.
+        This site is not set up yet: set SUPABASE_URL and SUPABASE_ANON_KEY on the worker.
       </p>
     );
   }

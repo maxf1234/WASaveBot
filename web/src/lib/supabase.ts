@@ -1,9 +1,9 @@
 import { createClient } from '@supabase/supabase-js';
+import { supabaseAnonKey as anonKey, supabaseUrl as url } from './config';
 
-const url = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
-
-export const configured = Boolean(url && anonKey && import.meta.env.VITE_API_URL);
+// The API URL is no longer required: served by the worker, the API is the same
+// origin and requests are relative.
+export const configured = Boolean(url && anonKey);
 
 // Placeholders keep the import from throwing when the env is missing; App
 // shows a setup message instead of rendering anything that would use them.

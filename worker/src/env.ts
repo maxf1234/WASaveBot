@@ -11,6 +11,17 @@ function positiveInt(name: string, fallback: number): number {
   return parsed;
 }
 
+function webUrl(): string {
+  const explicit = process.env.WEB_URL?.trim();
+  if (explicit) return explicit.replace(/\/+$/, '');
+  const railway = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
+  if (railway) return `https://${railway}`;
+  throw new Error(
+    'Missing environment variable WEB_URL (and no RAILWAY_PUBLIC_DOMAIN to fall back on: ' +
+      'generate a domain for the service under Settings → Networking)',
+  );
+}
+
 function required(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`Missing environment variable ${name}`);
@@ -27,6 +38,15 @@ export interface Env {
   trialDays: number;
   webUrl: string;
   port: number;
+  /**
+   * The public anon key, handed to the dashboard at load time via /config.js.
+   * Not a secret — it is in every browser that opens the site, and RLS is what
+   * protects the data — but it has to come from somewhere now the site is
+   * served by the worker rather than built with it baked in.
+   */
+  supabaseAnonKey?: string;
+  /** Where the built dashboard is. Unset or missing means the worker serves the API only. */
+  webRoot?: string;
   /** 32-byte key (64 hex chars) that encrypts the WhatsApp logins in wa_auth. */
   waAuthEncryptionKey: string;
   /**
@@ -81,8 +101,13 @@ export function loadEnv(): Env {
     stripeWebhookSecret: required('STRIPE_WEBHOOK_SECRET'),
     stripePriceId: required('STRIPE_PRICE_ID'),
     trialDays: Number.isFinite(trialDays) && trialDays > 0 ? Math.floor(trialDays) : 0,
-    // No trailing slash: it is compared against the browser's Origin header.
-    webUrl: required('WEB_URL').replace(/\/+$/, ''),
+    // No trailing slash: it is compared against the browser's Origin header,
+    // and it is the base of Stripe's return links. With the site served by
+    // the worker it is just this service's own address, so Railway's
+    // RAILWAY_PUBLIC_DOMAIN fills it in and there is one fewer thing to set.
+    webUrl: webUrl(),
+    supabaseAnonKey: process.env.SUPABASE_ANON_KEY?.trim() || undefined,
+    webRoot: process.env.WEB_ROOT?.trim() || undefined,
     port: Number(process.env.PORT) || 3000,
     waAuthEncryptionKey: required('WA_AUTH_ENCRYPTION_KEY'),
     waAuthEncryptionKeyPrevious: process.env.WA_AUTH_ENCRYPTION_KEY_PREVIOUS?.trim() || undefined,
