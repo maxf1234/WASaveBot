@@ -5,6 +5,7 @@ import { Button, Card, Notice } from '../components/ui';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { isSubscribed } from '../lib/supabase';
+import { billingEnabled } from '../lib/config';
 
 const LABELS: Record<string, string> = {
   none: 'No subscription',
@@ -69,7 +70,12 @@ export function Billing() {
       {error && <Notice kind="error">{error}</Notice>}
 
       <Card title="Your plan">
-        {!profile ? (
+        {!billingEnabled ? (
+          <p className="text-sm text-slate-600">
+            Billing isn't set up yet. You can connect WhatsApp and use the free preview, which shows who would be
+            saved without saving anyone.
+          </p>
+        ) : !profile ? (
           <p className="text-slate-500">Loading…</p>
         ) : (
           <>

@@ -8,7 +8,7 @@ import type { NextFunction, Request, Response } from 'express';
 import type Stripe from 'stripe';
 import type { AuthedUser, TokenVerifier } from './auth.js';
 import { HttpError } from './billing.js';
-import type { Billing } from './billing.js';
+import type { BillingApi } from './billing.js';
 import { errorMessage, log } from './log.js';
 import { maySave } from './store.js';
 import type { Store } from './store.js';
@@ -23,10 +23,16 @@ export interface AppDeps {
   /** Lower-cased emails allowed to see the admin page. Empty means nobody. */
   adminEmails?: string[];
   verifyToken: TokenVerifier;
-  /** Verifies the signature and parses the event; throws if it is not from Stripe. */
-  constructEvent: (rawBody: Buffer, signature: string) => Stripe.Event;
+  /**
+   * Verifies the signature and parses the event; throws if it is not from
+   * Stripe. Absent when no webhook secret is configured, and then the webhook
+   * answers 503 rather than pretending every signature is bad.
+   */
+  constructEvent?: (rawBody: Buffer, signature: string) => Stripe.Event;
+  /** Whether people can subscribe. Told to the dashboard through /config.js. */
+  billingEnabled?: boolean;
   store: Store;
-  billing: Pick<Billing, 'checkoutUrl' | 'portalUrl' | 'cancelAll' | 'handleEvent'>;
+  billing: BillingApi;
   /**
    * Only what the HTTP layer still needs from the worker: a socket count for
    * /health and the admin page, and a nudge so a reconcile happens in seconds
@@ -53,6 +59,13 @@ export function createApp(deps: AppDeps): express.Express {
 
   // Raw body: the signature is computed over the exact bytes Stripe sent.
   app.post('/api/stripe/webhook', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+    if (!deps.constructEvent) {
+      // 503 rather than 400: Stripe retries a 5xx, so an endpoint registered
+      // before the secret was set catches up once it is, instead of the events
+      // being written off as forgeries.
+      res.status(503).json({ error: 'Billing is not set up' });
+      return;
+    }
     let event: Stripe.Event;
     try {
       event = deps.constructEvent(req.body as Buffer, String(req.headers['stripe-signature'] ?? ''));
@@ -254,7 +267,13 @@ export function createApp(deps: AppDeps): express.Express {
   // dashboard routes in the browser.
 
   app.get('/config.js', (_req, res) => {
-    const config = { supabaseUrl: deps.supabaseUrl ?? '', supabaseAnonKey: deps.supabaseAnonKey ?? '' };
+    const config = {
+      supabaseUrl: deps.supabaseUrl ?? '',
+      supabaseAnonKey: deps.supabaseAnonKey ?? '',
+      // Lets the Billing page say "not set up yet" rather than offering a
+      // Subscribe button that can only fail.
+      billing: deps.billingEnabled ?? true,
+    };
     // `<` escaped so nothing in a value could ever close a script context.
     const body = `window.__SAVEBOT__ = ${JSON.stringify(config).replace(/</g, '\\u003c')};`;
     res

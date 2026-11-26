@@ -11,6 +11,25 @@ function positiveInt(name: string, fallback: number): number {
   return parsed;
 }
 
+/**
+ * A Stripe value, or undefined if it is absent or plainly not one.
+ *
+ * Every Stripe credential carries a fixed prefix, so anything without it — an
+ * empty value, `x`, a `<sk_test_…>` left over from a template — is treated as
+ * "not set" rather than handed to Stripe to fail on later, deep inside a
+ * customer's checkout. That lets a deployment leave placeholders in place until
+ * it is ready to take payments.
+ */
+function stripeValue(name: string, prefixes: string[]): string | undefined {
+  const value = process.env[name]?.trim();
+  if (!value) return undefined;
+  return prefixes.some((prefix) => value.startsWith(prefix)) ? value : undefined;
+}
+
+/** Billing works only with both of these. The webhook secret is checked separately. */
+export const billingConfigured = (env: Pick<Env, 'stripeSecretKey' | 'stripePriceId'>): boolean =>
+  Boolean(env.stripeSecretKey && env.stripePriceId);
+
 function webUrl(): string {
   const explicit = process.env.WEB_URL?.trim();
   if (explicit) return explicit.replace(/\/+$/, '');
@@ -32,9 +51,14 @@ export interface Env {
   supabaseUrl: string;
   supabaseServiceRoleKey: string;
   supabaseJwtSecret: string;
-  stripeSecretKey: string;
-  stripeWebhookSecret: string;
-  stripePriceId: string;
+  /**
+   * Stripe is optional. Without a secret key and a price the worker runs with
+   * billing switched off: nobody can subscribe, so every account stays in the
+   * free preview, and the Billing page says billing is not set up yet.
+   */
+  stripeSecretKey?: string;
+  stripeWebhookSecret?: string;
+  stripePriceId?: string;
   trialDays: number;
   webUrl: string;
   port: number;
@@ -97,9 +121,9 @@ export function loadEnv(): Env {
     supabaseUrl: required('SUPABASE_URL').replace(/\/+$/, ''),
     supabaseServiceRoleKey: required('SUPABASE_SERVICE_ROLE_KEY'),
     supabaseJwtSecret: required('SUPABASE_JWT_SECRET'),
-    stripeSecretKey: required('STRIPE_SECRET_KEY'),
-    stripeWebhookSecret: required('STRIPE_WEBHOOK_SECRET'),
-    stripePriceId: required('STRIPE_PRICE_ID'),
+    stripeSecretKey: stripeValue('STRIPE_SECRET_KEY', ['sk_', 'rk_']),
+    stripeWebhookSecret: stripeValue('STRIPE_WEBHOOK_SECRET', ['whsec_']),
+    stripePriceId: stripeValue('STRIPE_PRICE_ID', ['price_']),
     trialDays: Number.isFinite(trialDays) && trialDays > 0 ? Math.floor(trialDays) : 0,
     // No trailing slash: it is compared against the browser's Origin header,
     // and it is the base of Stripe's return links. With the site served by

@@ -65,6 +65,32 @@ function pick(subs: Stripe.Subscription[]): Stripe.Subscription | undefined {
   return [...subs].sort((a, b) => rank(a) - rank(b) || b.created - a.created)[0];
 }
 
+/**
+ * The billing interface the HTTP layer uses, so a deployment without Stripe
+ * can hand it something that answers clearly instead of a half-configured
+ * Stripe client that fails on the first request.
+ */
+export type BillingApi = Pick<Billing, 'checkoutUrl' | 'portalUrl' | 'cancelAll' | 'handleEvent'>;
+
+/**
+ * What runs when Stripe is not configured.
+ *
+ * Subscribing and the portal answer 503 with words a person can act on. The
+ * two calls that are not a customer asking for something — cancelling on
+ * account deletion, and a webhook — are quiet no-ops, because there is no
+ * subscription to cancel and nothing to sync.
+ */
+export const noBilling: BillingApi = {
+  checkoutUrl: async () => {
+    throw new HttpError(503, 'Billing is not set up yet');
+  },
+  portalUrl: async () => {
+    throw new HttpError(503, 'Billing is not set up yet');
+  },
+  cancelAll: async () => {},
+  handleEvent: async () => {},
+};
+
 export class Billing {
   constructor(
     private stripe: Stripe,
