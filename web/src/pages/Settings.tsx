@@ -37,7 +37,13 @@ export function Settings() {
   const templateOk = form.name_template.includes('{name}');
   const prefix = form.fallback_prefix.trim();
   const capOk = Number.isInteger(form.daily_cap) && form.daily_cap >= 1 && form.daily_cap <= 1000;
-  const valid = templateOk && prefix.length > 0 && capOk;
+  const savePhrase = form.save_phrase.trim();
+  const removePhrase = form.remove_phrase.trim();
+  const phrasesOk =
+    savePhrase.length >= 3 && savePhrase.length <= 64 &&
+    removePhrase.length >= 3 && removePhrase.length <= 64 &&
+    savePhrase.toLowerCase() !== removePhrase.toLowerCase();
+  const valid = templateOk && prefix.length > 0 && capOk && phrasesOk;
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -50,6 +56,9 @@ export function Settings() {
         fallback_prefix: prefix,
         save_to_phone: form.save_to_phone,
         daily_cap: form.daily_cap,
+        save_mode: form.save_mode,
+        save_phrase: savePhrase,
+        remove_phrase: removePhrase,
       })
       .eq('user_id', userId);
     setSaving(false);
@@ -71,8 +80,107 @@ export function Settings() {
     }
   }
 
+  async function setArmed(next: boolean) {
+    if (
+      next &&
+      !window.confirm(
+        'Start saving contacts for real?\n\n' +
+          'From now on people who message you are written into your WhatsApp contacts, ' +
+          "and to your phone's address book if that is on above.\n\n" +
+          'You can switch this off at any time. Contacts already saved stay saved.',
+      )
+    ) {
+      return;
+    }
+    setForm({ ...form!, armed: next });
+    const { error } = await supabase.from('settings').update({ armed: next }).eq('user_id', userId);
+    if (error) {
+      setForm({ ...form!, armed: !next });
+      setMessage({ kind: 'error', text: 'Could not change that. Try again.' });
+    }
+  }
+
   return (
     <>
+      <Card title="Saving">
+        <div className="space-y-5">
+          {!form.armed && (
+            <Notice>
+              <strong>Watch-only.</strong> Everyone who messages you is recorded on the Activity page
+              and nothing is written to your contacts. Turn this on once the list looks right.
+            </Notice>
+          )}
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="text-sm font-medium">Save contacts for real</div>
+              <div className="text-sm text-slate-500">
+                Off records what would have happened without touching your address book.
+              </div>
+            </div>
+            <Switch label="Save contacts for real" large checked={form.armed} onChange={(n) => void setArmed(n)} />
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Who gets saved">
+        <form onSubmit={save} className="space-y-5">
+          <Field
+            label="Save"
+            hint={
+              form.save_mode === 'everyone'
+                ? 'Every new person who messages you privately.'
+                : 'Only people who start their message with your phrase. Everyone else is left alone.'
+            }
+          >
+            <select
+              className={inputClass}
+              value={form.save_mode}
+              onChange={(e) => set('save_mode', e.target.value as SettingsRow['save_mode'])}
+            >
+              <option value="everyone">Everyone who messages me</option>
+              <option value="phrase">Only people who ask</option>
+            </select>
+          </Field>
+
+          {form.save_mode === 'phrase' && (
+            <Field
+              label="Phrase to be saved"
+              hint="It has to start their message, so “don’t save my number” does not count as asking."
+            >
+              <input
+                className={inputClass}
+                maxLength={64}
+                value={form.save_phrase}
+                onChange={(e) => set('save_phrase', e.target.value)}
+              />
+            </Field>
+          )}
+
+          <Field
+            label="Phrase to be removed"
+            hint="Works whatever the mode: anyone you have saved can send this and the contact is deleted."
+          >
+            <input
+              className={inputClass}
+              maxLength={64}
+              value={form.remove_phrase}
+              onChange={(e) => set('remove_phrase', e.target.value)}
+            />
+          </Field>
+
+          {!phrasesOk && (
+            <Notice kind="error">
+              Each phrase needs 3 to 64 characters, and the two must be different.
+            </Notice>
+          )}
+
+          {message && <Notice kind={message.kind}>{message.text}</Notice>}
+          <Button type="submit" disabled={saving || !valid}>
+            {saving ? 'Saving…' : 'Save settings'}
+          </Button>
+        </form>
+      </Card>
+
       <Card title="Contact names">
         <form onSubmit={save} className="space-y-5">
           <Field

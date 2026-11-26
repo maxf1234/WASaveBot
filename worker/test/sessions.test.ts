@@ -248,3 +248,39 @@ test('the worker source never calls anything the other person could see', () => 
     assert.doesNotMatch(readFileSync(new URL(file, dir), 'utf8'), forbidden, file);
   }
 });
+
+test('the socket surface the worker declares is only ever contact writes', () => {
+  // The test above is a blocklist, and a blocklist cannot anticipate the next
+  // visible call Baileys adds. This is the allowlist that can: TypeScript only
+  // permits the worker to call what these two interfaces declare, so auditing
+  // the interfaces audits every call site in the worker at once.
+  const source = readFileSync(new URL('../src/saver.ts', import.meta.url), 'utf8')
+    + readFileSync(new URL('../src/sessions.ts', import.meta.url), 'utf8');
+
+  // Method names declared on WaSocketLike / ManagedSocket, i.e. `name(args):`.
+  const declared = new Set<string>();
+  for (const block of source.matchAll(/interface (?:WaSocketLike|ManagedSocket)[^{]*\{([\s\S]*?)\n\}/g)) {
+    for (const member of block[1]!.matchAll(/^\s{2}(\w+)\s*\(/gm)) declared.add(member[1]!);
+  }
+
+  const allowed = new Set([
+    // The only two writes to WhatsApp, both to the user's own contact list and
+    // both invisible to the other person.
+    'addOrEditContact',
+    'removeContact',
+    // Connection management, which sends nothing into any chat.
+    'end',
+    'logout',
+    'requestPairingCode',
+  ]);
+
+  assert.ok(declared.size > 0, 'the interfaces should have been found');
+  assert.deepEqual(
+    [...declared].filter((name) => !allowed.has(name)).sort(),
+    [],
+    'a new socket method reached the worker: check it cannot be seen by the other person, then allow it here',
+  );
+  for (const required of ['addOrEditContact', 'removeContact']) {
+    assert.ok(declared.has(required), `${required} should still be declared`);
+  }
+});

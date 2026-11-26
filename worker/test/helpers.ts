@@ -1,6 +1,9 @@
 import { EventEmitter } from 'node:events';
 import type { ManagedSocket } from '../src/sessions.js';
-import type { ContactRow, Policy, Profile, SessionPatch, Settings, Store } from '../src/store.js';
+import type {
+  ContactRow, Policy, Profile, RuleRow, SaveEvent, SessionPatch, Settings, Store,
+} from '../src/store.js';
+import type { PrefixRule, RuleKind } from '../src/rules.js';
 
 export const USER = 'user-1';
 
@@ -10,6 +13,13 @@ export const defaultSettings = (): Settings => ({
   name_template: '{name}',
   fallback_prefix: 'WA',
   daily_cap: 200,
+  // Armed, which is what every existing customer is after 0002 backfills them.
+  // Tests that care about watch-only set it false themselves.
+  armed: true,
+  save_mode: 'everyone',
+  save_phrase: 'save my number',
+  remove_phrase: 'remove my number',
+  default_policy: 'allow',
 });
 
 /** An in-memory stand-in for Supabase. */
@@ -19,7 +29,10 @@ export class MemoryStore implements Store {
   profiles = new Map<string, Profile>();
   settings = new Map<string, Settings>();
   contacts = new Map<string, (ContactRow & { created_at: string })[]>();
+  rules = new Map<string, RuleRow[]>();
+  events = new Map<string, (SaveEvent & { occurred_at: string })[]>();
   deletedUsers: string[] = [];
+  #nextRuleId = 1;
 
   addUser(id: string, status = 'active'): void {
     this.profiles.set(id, { id, email: `${id}@example.com`, stripe_customer_id: null, subscription_status: status });
@@ -28,6 +41,26 @@ export class MemoryStore implements Store {
   }
   rows(userId = USER) {
     return this.contacts.get(userId) ?? [];
+  }
+  ruleRows(userId = USER) {
+    return this.rules.get(userId) ?? [];
+  }
+  eventRows(userId = USER) {
+    return this.events.get(userId) ?? [];
+  }
+  decisions(userId = USER) {
+    return this.eventRows(userId).map((e) => e.decision);
+  }
+  /** Add a rule without going through the API, for tests about matching. */
+  addRule(userId: string, kind: RuleKind, prefix: string, label: string | null = null): RuleRow {
+    const rows = this.ruleRows(userId);
+    this.rules.set(userId, rows);
+    const row: RuleRow = {
+      id: this.#nextRuleId++, kind, prefix, label, enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    rows.push(row);
+    return row;
   }
 
   async getAuth(userId: string, keys: string[]) {
@@ -65,7 +98,33 @@ export class MemoryStore implements Store {
     return {
       subscribed: ['active', 'trialing'].includes(this.profiles.get(userId)?.subscription_status ?? ''),
       settings: { ...(this.settings.get(userId) ?? defaultSettings()) },
+      rules: this.ruleRows(userId)
+        .filter((r) => r.enabled)
+        .map((r): PrefixRule => ({ id: r.id, kind: r.kind, prefix: r.prefix, label: r.label })),
     };
+  }
+
+  async recordEvent(userId: string, event: SaveEvent) {
+    const rows = this.eventRows(userId);
+    this.events.set(userId, rows);
+    rows.push({ ...event, occurred_at: new Date().toISOString() });
+  }
+  async countSavesSince(userId: string, sinceIso: string) {
+    return this.eventRows(userId).filter((e) => e.decision === 'saved' && e.occurred_at >= sinceIso).length;
+  }
+
+  async claimContact(userId: string, row: ContactRow) {
+    const rows = this.rows(userId);
+    this.contacts.set(userId, rows);
+    const existing = rows.find((r) => r.phone === row.phone);
+    if (!existing) {
+      rows.push({ ...row, created_at: new Date().toISOString() });
+      return true;
+    }
+    // A removed row is not a live claim: asking again is fresh consent.
+    if (existing.status !== 'removed') return false;
+    Object.assign(existing, row, { error: null, created_at: new Date().toISOString() });
+    return true;
   }
   async getProfile(userId: string) {
     return this.profiles.get(userId) ?? null;
@@ -135,6 +194,15 @@ export class FakeSocket implements ManagedSocket {
       throw new Error('boom');
     }
     this.saved.push({ jid, contact });
+  }
+  removed: string[] = [];
+  failNextRemove = 0;
+  async removeContact(jid: string) {
+    if (this.failNextRemove > 0) {
+      this.failNextRemove -= 1;
+      throw new Error('boom');
+    }
+    this.removed.push(jid);
   }
   end() {
     this.ended = true;

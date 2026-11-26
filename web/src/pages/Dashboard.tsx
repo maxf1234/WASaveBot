@@ -20,6 +20,7 @@ const CONTACT_STATUS: Record<SavedContact['status'], { label: string; style: str
   failed: { label: 'Failed', style: 'bg-red-100 text-red-800' },
   unresolved: { label: 'Number unknown', style: 'bg-amber-100 text-amber-800' },
   pending: { label: 'Not saved yet', style: 'bg-slate-100 text-slate-700' },
+  removed: { label: 'Removed on request', style: 'bg-slate-100 text-slate-500' },
 };
 
 const COLUMNS = 'id, phone, push_name, saved_name, status, error, created_at';

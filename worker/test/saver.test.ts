@@ -175,14 +175,24 @@ test('saves run one at a time, 3 to 6 seconds apart', async () => {
   for (const ms of sleeps) assert.ok(ms > 2900 && ms <= 6000, `gap ${ms}`);
 });
 
-test('the daily cap stops the queue and drops what is left', async () => {
+test('the daily cap stops the queue and holds what is left', async () => {
   const { store, sock, saver } = setup();
   store.settings.get(USER)!.daily_cap = 2;
   await saver.load();
   await saver.onMessages([1, 2, 3, 4].map((n) => msg(`1555123000${n}@s.whatsapp.net`, `P${n}`)));
   await saver.idle();
-  assert.equal(sock.saved.length, 2);
-  assert.equal(store.rows().length, 2, 'dropped jobs leave no row');
+  assert.equal(sock.saved.length, 2, 'only the cap is written');
+
+  // The two the cap cut off are held rather than thrown away. The old
+  // behaviour dropped them, which lost anybody who never messaged again.
+  const pending = store.rows().filter((r) => r.status === 'pending');
+  assert.equal(pending.length, 2, 'the rest are held as pending');
+  assert.deepEqual(
+    pending.map((r) => r.phone).sort(),
+    ['15551230003', '15551230004'],
+    'and it is the last two, in order',
+  );
+  assert.equal(store.decisions().filter((d) => d === 'capped').length, 2, 'both held rows are explained');
 
   // Saves made earlier today (before a restart) count towards the cap too.
   const again = new ContactSaver(USER, store, new PolicyCache(store, 0), () => sock, { sleep: async () => {} });
@@ -190,6 +200,23 @@ test('the daily cap stops the queue and drops what is left', async () => {
   await again.onMessages([msg('15551230009@s.whatsapp.net', 'Late')]);
   await again.idle();
   assert.equal(sock.saved.length, 2);
+});
+
+test('people the cap held are saved when the customer asks', async () => {
+  const { store, sock, saver } = setup();
+  store.settings.get(USER)!.daily_cap = 2;
+  await saver.load();
+  await saver.onMessages([1, 2, 3, 4].map((n) => msg(`1555123000${n}@s.whatsapp.net`, `P${n}`)));
+  await saver.idle();
+  assert.equal(sock.saved.length, 2);
+
+  // Tomorrow, with budget again: the held people go through the same queue as
+  // a backfill, because that is exactly what they now are.
+  store.settings.get(USER)!.daily_cap = 10;
+  assert.equal(await saver.backfill(), 2);
+  await saver.idle();
+  assert.equal(sock.saved.length, 4, 'the held pair is written on request');
+  assert.equal(store.rows().filter((r) => r.status === 'pending').length, 0);
 });
 
 test('a failed save is retried once, then recorded as failed and never tried again', async () => {

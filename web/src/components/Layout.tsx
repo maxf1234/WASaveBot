@@ -33,6 +33,12 @@ export function Layout() {
               <NavLink to="/dashboard" className={tab}>
                 Dashboard
               </NavLink>
+              <NavLink to="/activity" className={tab}>
+                Activity
+              </NavLink>
+              <NavLink to="/rules" className={tab}>
+                Rules
+              </NavLink>
               <NavLink to="/settings" className={tab}>
                 Settings
               </NavLink>

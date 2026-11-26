@@ -2,10 +2,12 @@ import { Navigate, Outlet, Route, Routes } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { AuthProvider, useAuth } from './lib/auth';
 import { configured } from './lib/supabase';
+import { Activity } from './pages/Activity';
 import { Billing } from './pages/Billing';
 import { Dashboard } from './pages/Dashboard';
 import { Privacy, Terms } from './pages/Legal';
 import { Login } from './pages/Login';
+import { Rules } from './pages/Rules';
 import { Settings } from './pages/Settings';
 
 function RequireUser() {
@@ -37,6 +39,8 @@ export function App() {
           <Route path="/privacy" element={<Privacy />} />
           <Route element={<RequireUser />}>
             <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/activity" element={<Activity />} />
+            <Route path="/rules" element={<Rules />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/billing" element={<Billing />} />
           </Route>

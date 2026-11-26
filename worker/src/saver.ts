@@ -1,18 +1,27 @@
 /**
- * The core: decide which incoming messages mean "a new person", and save them
- * as WhatsApp contacts one at a time.
+ * The core: decide what each incoming message means, and carry the decision out
+ * one contact at a time.
  *
  * One ContactSaver per user. It outlives reconnects, so the queue and the
- * in-memory set of known numbers carry over when a socket is replaced.
+ * in-memory view of known numbers carry over when a socket is replaced.
+ *
+ * The judgement itself is not here — it is `decide()`, a pure function over the
+ * message, the settings, the rules and four facts. This file's job is to gather
+ * those facts, run the queue, and write down what happened. Keeping the two
+ * apart is what makes "an unarmed account never writes to an address book"
+ * provable as a property rather than a flag every branch has to remember.
  *
  * Nothing in here (or anywhere in the worker) sends a message, a read receipt
- * or a presence update. The only write to WhatsApp is addOrEditContact, which
- * is a change to the user's own contact list and invisible to the other person.
+ * or a presence update. The only writes to WhatsApp are addOrEditContact and
+ * removeContact, both changes to the user's own contact list and both invisible
+ * to the other person. A test fails the build if that ever stops being true.
  */
 
-import { errorMessage, log, maskPhone } from './log.js';
+import { decide } from './decide.js';
+import type { Decision, Verdict } from './decide.js';
+import { describeError, log, maskName, maskPhone } from './log.js';
 import { buildName, isIgnoredChat, isLidJid, isPnJid, pnJidOf, userPart } from './naming.js';
-import type { PolicyCache, Store } from './store.js';
+import type { PolicyCache, SaveEvent, Store } from './store.js';
 
 /** The slice of a Baileys socket this module uses. */
 export interface WaSocketLike {
@@ -21,12 +30,30 @@ export interface WaSocketLike {
     jid: string,
     contact: { fullName: string; firstName: string; saveOnPrimaryAddressbook: boolean },
   ): Promise<void>;
+  /** Takes a contact back out, for an opt-out. Also invisible to the other person. */
+  removeContact(jid: string): Promise<void>;
   signalRepository: { lidMapping: { getPNForLID(lid: string): Promise<string | null> } };
+}
+
+/**
+ * The text carriers worth reading. Only plain text and captions can hold a
+ * phrase; a sticker or a location cannot, and is not inspected.
+ */
+export interface MessageContent {
+  conversation?: string | null;
+  extendedTextMessage?: { text?: string | null } | null;
+  imageMessage?: { caption?: string | null } | null;
+  videoMessage?: { caption?: string | null } | null;
 }
 
 export interface IncomingMessage {
   key: { remoteJid?: string | null; remoteJidAlt?: string | null; fromMe?: boolean | null };
   pushName?: string | null;
+  /**
+   * The message itself. Read for the trigger and the opt-out phrase, and for
+   * nothing else — it is never logged and never stored.
+   */
+  message?: MessageContent | null;
 }
 
 export interface IncomingContact {
@@ -37,15 +64,22 @@ export interface IncomingContact {
   notify?: string | null;
 }
 
+type JobKind = 'save' | 'remove';
+
 interface Job {
+  kind: JobKind;
   phone: string;
-  /** The row already exists (a backfill or a retry), so the result updates it. */
+  /** The row already exists (a backfill, a retry, an opt-out), so the result updates it. */
   update?: boolean;
   /** A retry the user asked for: run even though the number is already known. */
   force?: boolean;
   lid: string | null;
   pushName: string | null;
+  requestedName: string | null;
   name: string;
+  /** Carried so the activity row can name the rule that let this through. */
+  matchedPrefix?: string;
+  ruleId?: number;
 }
 
 export interface SaverOptions {
@@ -57,10 +91,25 @@ export interface SaverOptions {
 const utcDay = (d: Date): string => d.toISOString().slice(0, 10);
 const lidKey = (lidUser: string): string => `lid:${lidUser}`;
 
+/** The text of a message, whatever shape it arrived in. Empty when there is none. */
+export function bodyOf(message: IncomingMessage): string {
+  const content = message.message;
+  if (!content) return '';
+  return (
+    content.conversation ??
+    content.extendedTextMessage?.text ??
+    content.imageMessage?.caption ??
+    content.videoMessage?.caption ??
+    ''
+  );
+}
+
 export class ContactSaver {
-  /** Every phone that has a saved_contacts row: saved, existing or failed. */
+  /** Numbers with a live saved_contacts row: saved, existing, failed or unresolved. */
   #known = new Set<string>();
-  /** People from existing chats, found when linking, waiting for the user to say "save them". */
+  /** Numbers whose row is 'removed'. They asked not to be held; a fresh request revives them. */
+  #optedOut = new Set<string>();
+  /** People from existing chats or held by the cap, waiting for the user to say "save them". */
   #candidates = new Map<string, { pushName: string | null; lid: string | null }>();
   /** Push names seen in the history sync, by phone, for naming candidates. */
   #pushNames = new Map<string, string>();
@@ -70,7 +119,7 @@ export class ContactSaver {
   #running = false;
   #savedToday = 0;
   #day = '';
-  #lastSaveAt = 0;
+  #lastWriteAt = 0;
   #loaded = false;
   #chain: Promise<void> = Promise.resolve();
 
@@ -94,19 +143,27 @@ export class ContactSaver {
   async load(): Promise<void> {
     if (this.#loaded) return;
     for (const row of await this.store.loadContacts(this.userId)) {
-      if (row.status === 'pending') this.#candidates.set(row.phone, { pushName: row.push_name, lid: row.lid });
-      else this.#known.add(row.phone);
+      if (row.status === 'pending') {
+        this.#candidates.set(row.phone, { pushName: row.push_name, lid: row.lid });
+      } else if (row.status === 'removed') {
+        this.#optedOut.add(row.phone);
+      } else {
+        this.#known.add(row.phone);
+      }
     }
     const now = this.#now();
     this.#day = utcDay(now);
-    this.#savedToday = await this.store.countSavedSince(this.userId, `${this.#day}T00:00:00Z`);
+    // Counted from the activity log rather than from saved_contacts: the log is
+    // append-only, so a contact that is later removed cannot quietly give the
+    // customer back a slot they already spent.
+    this.#savedToday = await this.store.countSavesSince(this.userId, `${this.#day}T00:00:00Z`);
     this.#loaded = true;
   }
 
   /** Events are handled strictly in arrival order, one batch at a time. */
   #inOrder(work: () => Promise<void>): Promise<void> {
     this.#chain = this.#chain.then(work).catch((error) => {
-      log.error('saver event failed', { userId: this.userId, error: errorMessage(error) });
+      log.error('saver event failed', { userId: this.userId, ...describeError(error) });
     });
     return this.#chain;
   }
@@ -149,30 +206,55 @@ export class ContactSaver {
           continue;
         }
         if (!contact.id || isIgnoredChat(contact.id)) continue;
-        if (this.#known.has(phone) || this.#candidates.has(phone) || this.#queued.has(phone)) continue;
-        const sock = this.getSock();
-        if (sock?.user?.id && userPart(sock.user.id) === phone) continue;
+        if (this.#isTracked(phone) || this.#queued.has(phone)) continue;
+        if (this.#isSelf(phone)) continue;
         const lid = isLidJid(contact.lid) ? contact.lid : isLidJid(contact.id) ? contact.id : null;
         const pushName = this.#pushNames.get(phone) ?? null;
         this.#candidates.set(phone, { pushName, lid });
-        await this.store.insertContact(this.userId, { phone, lid, push_name: pushName, status: 'pending' });
+        await this.store.claimContact(this.userId, {
+          phone, lid, push_name: pushName, status: 'pending',
+        });
       }
     });
   }
 
-  /** Queue every backfill candidate. Returns how many were queued. */
+  /** Queue every waiting candidate — backfill or held by the cap. Returns how many. */
   async backfill(): Promise<number> {
-    const policy = await this.policy.get(this.userId);
+    const { settings, rules } = await this.policy.get(this.userId);
     let queued = 0;
     for (const [phone, candidate] of this.#candidates) {
       if (this.#known.has(phone) || this.#queued.has(phone)) continue;
+      // A candidate is still subject to the rules: the customer may have added
+      // one since the backfill list was gathered.
+      const verdict = decide(
+        { phone, body: '' },
+        // Backfill is an explicit instruction, so the save phrase does not
+        // apply to it — the customer pressed the button for these people.
+        { ...settings, save_mode: 'everyone' },
+        rules,
+        { alreadyKnown: false, optedOut: this.#optedOut.has(phone), subscribed: true, capped: false },
+      );
+      if (verdict.action !== 'save') {
+        await this.#record(verdict.decision, {
+          phone,
+          push_name: candidate.pushName,
+          matched_prefix: verdict.matchedPrefix ?? null,
+          rule_id: verdict.ruleId ?? null,
+          detail: verdict.detail ?? null,
+        });
+        continue;
+      }
       this.#queued.add(phone);
       this.#jobs.push({
+        kind: 'save',
         phone,
         update: true,
         lid: candidate.lid,
         pushName: candidate.pushName,
-        name: buildName(candidate.pushName, phone, policy.settings),
+        requestedName: null,
+        name: buildName(candidate.pushName, phone, settings),
+        matchedPrefix: verdict.matchedPrefix,
+        ruleId: verdict.ruleId,
       });
       queued += 1;
     }
@@ -184,18 +266,34 @@ export class ContactSaver {
   async retry(phone: string): Promise<boolean> {
     const row = await this.store.getContact(this.userId, phone);
     if (!row || row.status !== 'failed' || this.#queued.has(phone)) return false;
-    const policy = await this.policy.get(this.userId);
+    const { settings } = await this.policy.get(this.userId);
     this.#queued.add(phone);
     this.#jobs.push({
+      kind: 'save',
       phone,
       update: true,
       force: true,
       lid: row.lid,
       pushName: row.push_name,
-      name: buildName(row.push_name, phone, policy.settings),
+      requestedName: null,
+      name: buildName(row.push_name, phone, settings),
     });
     void this.#run();
     return true;
+  }
+
+  #isTracked(phone: string): boolean {
+    return this.#known.has(phone) || this.#candidates.has(phone) || this.#optedOut.has(phone);
+  }
+
+  /** The user's own number, reached from another of their devices. Not a contact. */
+  #isSelf(phone: string): boolean {
+    const me = this.getSock()?.user?.id;
+    return Boolean(me && userPart(me) === phone);
+  }
+
+  async #record(decision: Decision, event: Omit<SaveEvent, 'decision'>): Promise<void> {
+    await this.store.recordEvent(this.userId, { ...event, decision });
   }
 
   async #phoneOf(contact: IncomingContact): Promise<string> {
@@ -216,9 +314,6 @@ export class ContactSaver {
     const remoteJid = message.key.remoteJid;
     if (!remoteJid || isIgnoredChat(remoteJid)) return;
 
-    const policy = await this.policy.get(this.userId);
-    if (!policy.settings.enabled || !policy.subscribed) return;
-
     const sock = this.getSock();
     let pnJid: string | null;
     let lid: string | null = null;
@@ -234,35 +329,107 @@ export class ContactSaver {
     }
 
     const phone = pnJid ? userPart(pnJid) : '';
+    if (phone && this.#isSelf(phone)) return;
+
+    const { settings, subscribed, rules } = await this.policy.get(this.userId);
+
+    // A sender with no readable number. Recorded once, then left alone: there
+    // is nothing to put in an address book, and the row is how the customer
+    // finds out rather than wondering.
     if (!phone) {
       const key = lidKey(userPart(lid ?? '') || (lid ?? remoteJid));
       if (this.#known.has(key)) return;
       this.#known.add(key);
-      await this.store.insertContact(this.userId, {
-        phone: key,
-        lid,
+      await this.store.claimContact(this.userId, {
+        phone: key, lid, push_name: message.pushName ?? null, status: 'unresolved',
+      });
+      await this.#record('unresolved', {
+        phone: null,
         push_name: message.pushName ?? null,
-        status: 'unresolved',
+        detail: 'WhatsApp gave no phone number for this sender',
       });
       return;
     }
 
-    // The user's own number (a note to self from another device) is not a contact.
-    if (sock?.user?.id && userPart(sock.user.id) === phone) return;
-    if (this.#known.has(phone) || this.#queued.has(phone)) return;
+    if (this.#queued.has(phone)) return;
+
+    const verdict = decide(
+      { phone, body: bodyOf(message) },
+      settings,
+      rules,
+      {
+        alreadyKnown: this.#known.has(phone),
+        optedOut: this.#optedOut.has(phone),
+        subscribed,
+        capped: this.#savedToday >= settings.daily_cap,
+      },
+    );
 
     // A sender we could not resolve earlier now has a number: drop the placeholder.
     const stale = lid ? lidKey(userPart(lid)) : null;
     if (stale && this.#known.delete(stale)) await this.store.deleteContact(this.userId, stale);
 
-    this.#queued.add(phone);
-    this.#jobs.push({
+    await this.#apply(verdict, {
       phone,
-      // A backfill candidate who messages gets saved now; their row already exists.
-      update: this.#candidates.has(phone),
       lid,
       pushName: message.pushName ?? null,
-      name: buildName(message.pushName, phone, policy.settings),
+      settings,
+    });
+  }
+
+  /** Turn a verdict into a queued job, a held row, an activity row, or nothing. */
+  async #apply(
+    verdict: Verdict,
+    context: {
+      phone: string;
+      lid: string | null;
+      pushName: string | null;
+      settings: Awaited<ReturnType<PolicyCache['get']>>['settings'];
+    },
+  ): Promise<void> {
+    const { phone, lid, pushName, settings } = context;
+
+    if (verdict.silent) return;
+
+    const event: Omit<SaveEvent, 'decision'> = {
+      phone,
+      push_name: pushName,
+      matched_prefix: verdict.matchedPrefix ?? null,
+      rule_id: verdict.ruleId ?? null,
+      detail: verdict.detail ?? null,
+    };
+
+    if (verdict.action === 'none') {
+      // Held by the cap: kept as a candidate so the customer can press
+      // "Save them" rather than the person being silently dropped and lost if
+      // they never message again — which is what the old queue did.
+      if (verdict.decision === 'capped' && !this.#candidates.has(phone)) {
+        this.#candidates.set(phone, { pushName, lid });
+        await this.store.claimContact(this.userId, {
+          phone, lid, push_name: pushName, status: 'pending',
+        });
+      }
+      await this.#record(verdict.decision, event);
+      return;
+    }
+
+    const name =
+      verdict.action === 'save'
+        ? buildName(verdict.requestedName ?? pushName, phone, settings)
+        : '';
+
+    this.#queued.add(phone);
+    this.#jobs.push({
+      kind: verdict.action,
+      phone,
+      // A candidate or an opted-out person already has a row to update.
+      update: this.#candidates.has(phone) || this.#optedOut.has(phone),
+      lid,
+      pushName,
+      requestedName: verdict.requestedName ?? null,
+      name,
+      matchedPrefix: verdict.matchedPrefix,
+      ruleId: verdict.ruleId,
     });
     void this.#run();
   }
@@ -270,6 +437,10 @@ export class ContactSaver {
   /**
    * A contact that arrives with `name` set is one the user saved themselves.
    * Record it as 'existing' so it is never touched.
+   *
+   * No activity row: the whole address book arrives this way right after
+   * linking, and hundreds of "you already had them" rows would bury the log.
+   * The saved_contacts row is the record.
    */
   async #onContact(contact: IncomingContact): Promise<void> {
     const name = contact.name?.trim();
@@ -279,12 +450,13 @@ export class ContactSaver {
     if (!phone || this.#known.has(phone)) return;
 
     this.#known.add(phone);
+    this.#optedOut.delete(phone);
     if (this.#candidates.delete(phone)) {
       // A backfill candidate the user has since saved by hand.
       await this.store.updateContact(this.userId, phone, { status: 'existing', saved_name: name });
       return;
     }
-    await this.store.insertContact(this.userId, {
+    await this.store.claimContact(this.userId, {
       phone,
       lid: isLidJid(contact.lid) ? contact.lid : isLidJid(contact.id) ? contact.id : null,
       push_name: contact.notify ?? null,
@@ -293,7 +465,7 @@ export class ContactSaver {
     });
   }
 
-  /** One save at a time, 3 to 6 seconds apart, until the daily cap. */
+  /** One write at a time, 3 to 6 seconds apart, until the daily cap. */
   async #run(): Promise<void> {
     if (this.#running) return;
     this.#running = true;
@@ -305,41 +477,70 @@ export class ContactSaver {
           this.#savedToday = 0;
         }
 
-        const policy = await this.policy.get(this.userId);
-        if (this.#savedToday >= policy.settings.daily_cap) {
-          // Done for the day: leftover jobs are dropped, not carried over.
-          log.info('daily cap reached, dropping queue', {
-            userId: this.userId,
-            dropped: this.#jobs.length + 1,
-          });
-          this.#jobs = [];
-          this.#queued.clear();
+        const { settings, subscribed } = await this.policy.get(this.userId);
+        this.#queued.delete(job.phone);
+
+        // An opt-out is honoured whatever else is true: not gated on the cap,
+        // on `enabled`, on `armed`, or on the subscription. Somebody asking not
+        // to be held is not a write the safety catch exists to prevent.
+        if (job.kind === 'remove') {
+          await this.#pause();
+          await this.#remove(job);
+          continue;
+        }
+
+        if (this.#savedToday >= settings.daily_cap) {
+          // Out of budget. What is left becomes a candidate rather than being
+          // thrown away, so the customer can save them from the dashboard.
+          await this.#holdRemaining(job);
           return;
         }
 
-        this.#queued.delete(job.phone);
         // Switched off, unsubscribed, or saved by hand while it waited.
         const done = this.#known.has(job.phone) && !job.force;
-        if (!policy.settings.enabled || !policy.subscribed || done) continue;
+        if (!settings.enabled || !subscribed || done) continue;
 
         await this.#pause();
         if (this.#known.has(job.phone) && !job.force) continue;
         // Claimed before the call, so the contact event WhatsApp echoes back
         // for our own save is not mistaken for one the user made by hand.
         this.#known.add(job.phone);
-        await this.#save(job, policy.settings.save_to_phone);
+        this.#optedOut.delete(job.phone);
+        await this.#save(job, settings.save_to_phone);
       }
     } catch (error) {
-      log.error('save queue failed', { userId: this.userId, error: errorMessage(error) });
+      log.error('save queue failed', { userId: this.userId, ...describeError(error) });
     } finally {
       this.#running = false;
     }
   }
 
+  /** The cap ran out mid-queue: park this job and the rest as candidates. */
+  async #holdRemaining(current: Job): Promise<void> {
+    const held = [current, ...this.#jobs.filter((j) => j.kind === 'save')];
+    this.#jobs = [];
+    this.#queued.clear();
+    for (const job of held) {
+      if (this.#known.has(job.phone)) continue;
+      if (!this.#candidates.has(job.phone)) {
+        this.#candidates.set(job.phone, { pushName: job.pushName, lid: job.lid });
+        await this.store.claimContact(this.userId, {
+          phone: job.phone, lid: job.lid, push_name: job.pushName, status: 'pending',
+        });
+      }
+      await this.#record('capped', {
+        phone: job.phone,
+        push_name: job.pushName,
+        detail: 'the daily cap is spent; held for you to save when you are ready',
+      });
+    }
+    log.info('daily cap reached, holding the rest', { userId: this.userId, held: held.length });
+  }
+
   async #pause(): Promise<void> {
-    if (!this.#lastSaveAt) return;
+    if (!this.#lastWriteAt) return;
     const gap = 3000 + this.#random() * 3000;
-    const wait = this.#lastSaveAt + gap - Date.now();
+    const wait = this.#lastWriteAt + gap - Date.now();
     if (wait > 0) await this.#sleep(wait);
   }
 
@@ -358,9 +559,9 @@ export class ContactSaver {
         });
         failure = '';
       } catch (error) {
-        failure = errorMessage(error) || 'unknown error';
+        failure = describeError(error).error || 'unknown error';
       }
-      this.#lastSaveAt = Date.now();
+      this.#lastWriteAt = Date.now();
       if (!failure) break;
     }
 
@@ -370,17 +571,72 @@ export class ContactSaver {
       lid: job.lid,
       push_name: job.pushName,
       saved_name: job.name,
+      requested_name: job.requestedName,
       status: failure ? ('failed' as const) : ('saved' as const),
       error: failure || null,
     };
     this.#candidates.delete(job.phone);
     if (job.update) await this.store.updateContact(this.userId, job.phone, row);
-    else await this.store.insertContact(this.userId, row);
+    else await this.store.claimContact(this.userId, row);
+
+    await this.#record(failure ? 'failed' : 'saved', {
+      phone: job.phone,
+      push_name: job.pushName,
+      saved_name: job.name,
+      matched_prefix: job.matchedPrefix ?? null,
+      rule_id: job.ruleId ?? null,
+      detail: failure || null,
+    });
     log.info(failure ? 'contact save failed' : 'contact saved', {
       userId: this.userId,
       phone: maskPhone(job.phone),
+      name: maskName(job.name),
       ...(failure ? { error: failure } : {}),
     });
+  }
+
+  /**
+   * Take a contact back out, because they asked.
+   *
+   * A failure leaves the row as it was and records the attempt: the contact is
+   * still in the customer's address book, and saying otherwise in the one place
+   * they can check would be a lie. They can see it and ask us again.
+   */
+  async #remove(job: Job): Promise<void> {
+    let failure = '';
+    try {
+      const sock = this.getSock();
+      if (!sock) throw new Error('WhatsApp is not connected');
+      await sock.removeContact(pnJidOf(job.phone));
+    } catch (error) {
+      failure = describeError(error).error || 'unknown error';
+    }
+    this.#lastWriteAt = Date.now();
+
+    if (failure) {
+      await this.#record('failed', {
+        phone: job.phone,
+        push_name: job.pushName,
+        detail: `could not remove the contact: ${failure}`,
+      });
+      log.error('contact removal failed', {
+        userId: this.userId, phone: maskPhone(job.phone), error: failure,
+      });
+      return;
+    }
+
+    this.#known.delete(job.phone);
+    this.#candidates.delete(job.phone);
+    this.#optedOut.add(job.phone);
+    await this.store.updateContact(this.userId, job.phone, {
+      status: 'removed', error: null, saved_name: null,
+    });
+    await this.#record('removed', {
+      phone: job.phone,
+      push_name: job.pushName,
+      detail: 'the sender asked to be removed',
+    });
+    log.info('contact removed on request', { userId: this.userId, phone: maskPhone(job.phone) });
   }
 
   /** For tests and /health: resolves when the queue is empty and idle. */

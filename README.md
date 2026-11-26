@@ -1,6 +1,8 @@
 # SaveBot
 
-A customer signs up, subscribes, links their own WhatsApp by typing a pairing code into it, and from then on every new person who messages them privately is saved as a contact in WhatsApp (and, optionally, in their phone's address book). The bot never sends anything from the linked account.
+A customer signs up, subscribes, links their own WhatsApp by typing a pairing code into it, and from then on new people who message them privately are saved as contacts in WhatsApp (and, optionally, in their phone's address book). The bot never sends anything from the linked account.
+
+Who counts as "new people" is theirs to choose: everyone who messages, or only those who ask with a phrase. Either way they can refuse whole country or area codes, watch it run before it writes anything, see why each person was or was not saved, and anyone saved can ask to be removed.
 
 ## What was reused, and from where
 
@@ -14,6 +16,7 @@ A customer signs up, subscribes, links their own WhatsApp by typing a pairing co
 | Stripe env var names (`STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID`, `STRIPE_WEBHOOK_SECRET`), `client_reference_id` on Checkout, raw-body signature check, tolerance of out-of-order subscription events | `whatsapp-auto-poster`, `lib/billing.js` |
 | AES-256-GCM encryption of the stored WhatsApp login keys | `contact-saver`, `api/src/lib/crypto.ts` (same idea, key in `WA_AUTH_ENCRYPTION_KEY`) |
 | Phone masking in logs | `contact-saver`, `api/src/lib/logging.ts` |
+| The trigger parser and its name handling, the prefix matcher, the pure decision, the watch-only catch and the activity log | `contact-saver`, `api/src/domain/` |
 | Vercel SPA rewrite in `vercel.json` | `affiliate-2.0` |
 
 Where those repos differ from the build document, the document won: Supabase instead of a direct Postgres connection, Express instead of Fastify, the Stripe SDK instead of hand-rolled `fetch`, `baileys@7.0.0-rc14` instead of `@whiskeysockets/baileys@6.x`. None of my repos used Supabase, so the Supabase client setup is new. One later change overrides the document: linking uses a pairing code, not a QR code, so `wa_sessions` has `pairing_code` and status `pairing` where the document had `qr`.
@@ -23,8 +26,15 @@ Where those repos differ from the build document, the document won: Supabase ins
 ```
 worker/     Node + TypeScript + Express + Baileys. One always-on Railway instance.
 web/        React + Vite + TypeScript + Tailwind. Deployed on Vercel.
-supabase/   The migration, and an RLS test that runs on a throwaway Postgres.
+supabase/   The migrations, and an RLS test that runs on a throwaway Postgres.
 ```
+
+The worker's decision is a pure function, `worker/src/decide.ts`: it takes the
+message, the settings, the rules and four facts, and returns a verdict. It
+touches no socket and no database. `saver.ts` gathers the facts, carries out
+the verdict and writes down what happened. That split is what makes the
+product's riskiest property — an unarmed account never writes to an address
+book — provable over every combination of settings rather than hoped for.
 
 The web app reads its own rows straight from Supabase under RLS. Anything touching WhatsApp or Stripe goes through the worker with the user's Supabase JWT.
 
@@ -33,7 +43,7 @@ The web app reads its own rows straight from Supabase under RLS. Anything touchi
 ### 1. Supabase
 
 1. Create a project.
-2. SQL Editor: paste and run `supabase/migrations/0001_init.sql` (or `supabase db push` with the CLI).
+2. SQL Editor: run every file in `supabase/migrations/` in order (or `supabase db push` with the CLI).
 3. Authentication → Providers: Email on. For quick testing turn "Confirm email" off; with it on, set Authentication → URL Configuration → Site URL to the Vercel URL.
 4. Collect: Project URL, anon key, service-role key, JWT secret (Settings → API).
 
@@ -80,6 +90,42 @@ stripe listen --forward-to localhost:3000/api/stripe/webhook
 2. Add the variables from `web/.env.example`. `VITE_API_URL` is the Railway URL.
 3. Deploy, then put the final Vercel URL into the worker's `WEB_URL` and Supabase's Site URL.
 
+## Upgrading an existing deployment
+
+`0002` and `0003` are additive, and the ordering matters for one column.
+
+`settings.armed` defaults to **false**, because a new account should record what
+it would do before it touches a real address book. Every customer who already
+exists is saving today with `enabled` as their only switch, so the migration
+**backfills `armed = true` for every existing row**. Run it as one statement —
+which is what `supabase db push` and the SQL Editor both do — and no live
+customer stops saving for even a moment. Deploy the worker after the migration:
+the old worker ignores the new columns, and the new worker treats a missing
+settings row as unarmed rather than armed.
+
+One small, deliberate effect on the day you upgrade: the daily cap now counts
+from `save_events` rather than from `saved_contacts`, because the activity log
+is append-only and a contact that is later removed cannot quietly hand back a
+slot that was already spent. `save_events` starts empty, so on the first day a
+customer can save up to their cap again. Nothing else changes.
+
+## What came from contact-saver, and what deliberately did not
+
+`contact-saver` replies to whoever asked, and that is the one thing not brought
+across. This product's whole claim is that it is invisible to the other person:
+the only WhatsApp writes are to the customer's own contact list, and a build
+test enforces it. Replying would be the single largest change to the ban risk
+that customers are taking with their own numbers, so the guard stayed and the
+replies did not. An opt-out is therefore silent — the contact is deleted and the
+sender is not told, which is the best available trade here.
+
+Google Contacts sync is not here either. WhatsApp's own `saveOnPrimaryAddressbook`
+already puts contacts in the phone's address book, so a second destination would
+add a Google OAuth consent screen and a sensitive-scope verification review for
+a mostly duplicate result. The save path is shaped so one could be added later
+without a rewrite: `decide()` returns a verdict, and `saver.ts` is the only thing
+that carries it out.
+
 ## Renaming the product
 
 Change `APP_NAME` in `web/src/brand.ts`. That is the only place the name appears in the app (page title, header, login, footer, Terms, Privacy). The worker uses the name in one place, the disconnect email, and reads it from its `APP_NAME` variable on Railway. The `<title>` in `web/index.html` is overwritten at startup; change it too if you care about the first few milliseconds. The npm package names (`savebot-worker`, `savebot-web`) are internal.
@@ -106,19 +152,38 @@ cd worker && npm test
 ./supabase/tests/run.sh
 ```
 
-The worker tests cover the save rules, the queue, sessions and reconnects, the HTTP API and the Stripe webhook against in-memory fakes. The second command needs local Postgres server binaries; it applies the migration and checks, with two users, that neither can read or change the other's rows.
+111 worker tests, against in-memory fakes: the save rules, the trigger parsing,
+the prefix matching, the queue, sessions and reconnects, the HTTP API and the
+Stripe webhook. Two are worth knowing about:
+
+- `decide.test.ts` sweeps 640 combinations of mode, policy, rules, subscription,
+  cap and opt-out state asserting that an unarmed account never produces a save.
+- `sessions.test.ts` holds both no-send guards, and the allowlist one is itself
+  checked: adding a method to the socket interface makes it fail.
+
+The second command needs local Postgres server binaries. It applies every
+migration in order — so it also proves they apply to each other — and checks,
+with two users, that neither can read or change the other's rows, that the
+WhatsApp logins are unreachable, that rules are fully editable by their owner
+and invisible to anyone else, and that the activity log cannot be rewritten.
 
 ## Behaviour worth knowing
 
-- **Daily cap** counts successful saves per UTC day. When it is hit the rest of the queue is dropped; those people are saved the next time they message.
+- **Save modes**: `everyone` saves each new person who messages privately, which is what every existing account does. `phrase` saves only people whose message *starts with* the customer's phrase — anchored deliberately, because "don't save my number" and "did you save my number?" both contain it and neither is a request. In phrase mode the name the sender gives beats their WhatsApp name, and politeness is stripped, so "save my number please" does not file a contact called "please".
+- **Watch-only**: a new account starts unarmed. Everyone who messages appears on the Activity page with "would have been saved" and nothing is written. This matters more here than it would in a read-only tool — a wrong rule writes strangers into an address book that has already synced to a phone, and undoing that is manual. Arming asks for confirmation.
+- **Rules**: a rule is leading digits of the full international number, so `234` is all of Nigeria and `1917` is the 917 area code — one mechanism, because a NANP number is 1 + area code + 7 digits. Longest match wins, which gives exceptions for free: refuse `234`, allow `234803`. `default_policy` decides what happens to numbers no rule covers; set it to refuse and the allow rules become an allowlist, which is the only way to express "only these countries".
+- **Opt-out**: anyone saved can send the removal phrase, in either mode. The contact is deleted with `removeContact` and the row is kept as `removed` — the row is the record that they objected, and deleting it would let their next message save them again. In `everyone` mode an ordinary message is *not* a request to be re-added, so the opt-out holds; only the save phrase revives them, because that is them asking.
+- **Activity log**: every decision is a row, including the refusals. This is the page that answers "my friend messaged me and never got saved" — the row says `refused by one of your rules`, `held — daily limit reached`, `saving was switched off`, `no active subscription` or `WhatsApp gave no number`. Ongoing traffic from somebody already saved is not recorded, because it would bury everything else.
+- **Daily cap** counts real writes per UTC day, from the activity log. When it is hit the rest are **held** as pending rather than dropped, and the customer saves them from the dashboard with the same button the backfill uses. The old behaviour discarded them, which lost anybody who never messaged again.
 - **Names**: the sender's WhatsApp name is trimmed, stripped of control and invisible characters and cut to 60 characters. A name with no letter or digit left (empty, emoji only) gets `<fallback prefix> <last 4 digits>`.
 - **Unresolved senders**: when a sender arrives as `@lid` and WhatsApp gives no phone number, a row is stored with status `unresolved` and `phone` set to `lid:<id>` (the column is `not null` and unique per user). It is replaced by a normal row once the number resolves.
 - **Existing contacts**: any contact WhatsApp reports with a saved name is recorded as `existing` and never touched. The list WhatsApp sends right after linking (`messaging-history.set`) is read for this too, in addition to `contacts.upsert` and `contacts.update`.
-- **Failed saves** are retried once, then recorded as `failed`. They are not attempted again unless the customer presses Retry on that row in the dashboard.
+- **Failed saves** are retried once, then recorded as `failed`. They are not attempted again unless the customer presses Retry on that row in the dashboard. A failed save still holds the claim on that number, so a later message cannot create a second contact for somebody whose first save is merely broken.
 - **Backfill**: when WhatsApp is linked it sends the recent chat list. A private chat with no saved name is stored as `pending` and nothing is done with it until the customer presses "Save them" on the dashboard; then they go through the same queue, pacing and daily cap. Ones the cap cuts off stay `pending`. A pending person who messages is saved straight away.
 - **Encrypted logins**: every value in `wa_auth` is AES-256-GCM encrypted with `WA_AUTH_ENCRYPTION_KEY`. The database alone cannot log in to anyone's WhatsApp.
 - **Disconnect email**: when WhatsApp logs a customer out (not when they press Disconnect, and not when their subscription lapses) they get one email with a link back to the dashboard.
 - **No grace period**: the moment Stripe reports a status other than `active` or `trialing` (including a failed payment), that customer's socket is closed and saving stops. It resumes on its own, with no new pairing, when the status is good again.
 - **Linking**: the user enters their own WhatsApp number, the worker asks WhatsApp for an 8-character code, and the user types it under Linked devices → Link a device → Link with phone number instead. If nobody enters it before WhatsApp gives up, the session goes back to "Not connected" instead of retrying forever. Pressing Connect again with a different number starts over.
 - **Subscription changes**: every Stripe event triggers a fresh lookup of the customer's subscriptions, so events arriving out of order cannot leave a wrong status.
-- **Invisible to the other person**: the only call made to WhatsApp is `addOrEditContact`. A test fails the build if the worker source ever calls `sendMessage`, read receipts or presence.
+- **Invisible to the other person**: the only calls made to WhatsApp are `addOrEditContact` and `removeContact`, both changes to the customer's own contact list. Two tests guard this. One is a blocklist over the source for `sendMessage`, read receipts and presence. The other is an allowlist over the socket interfaces the worker declares — TypeScript only permits calls to what those declare, so auditing them audits every call site, and a new Baileys method cannot slip in just because nobody thought to add it to a blocklist.
+- **Dedupe**: `unique (user_id, phone)` on `saved_contacts` is the authority, claimed in one insert-or-nothing statement. The in-memory set this replaced was correct only because the worker is pinned to one replica; the claim is correct regardless, and survives a restart mid-save.

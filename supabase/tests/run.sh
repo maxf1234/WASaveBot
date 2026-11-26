@@ -13,5 +13,6 @@ run "$bin/initdb -D $dir/data -A trust -U postgres" >/dev/null
 run "$bin/pg_ctl -D $dir/data -o \"-p $port -k $dir -c listen_addresses=''\" -w start" >/dev/null
 q() { psql -v ON_ERROR_STOP=1 -q -h "$dir" -p "$port" -U postgres -d postgres -f "$1"; }
 q "$here/supabase_shim.sql"
-q "$here/../migrations/0001_init.sql"
+# Every migration in order, so the test also proves they apply to each other.
+for m in "$here"/../migrations/*.sql; do q "$m"; done
 q "$here/rls.sql"
