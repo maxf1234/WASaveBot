@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import type { ManagedSocket } from '../src/sessions.js';
 import type {
-  ContactRow, Policy, Profile, RuleRow, SaveEvent, SessionPatch, Settings, Store,
+  ContactRow, Policy, Profile, RuleRow, SaveEvent, SessionPatch, SessionStatus, Settings, Store,
 } from '../src/store.js';
 import { maySave } from '../src/store.js';
 import type { PrefixRule, RuleKind } from '../src/rules.js';
@@ -29,7 +29,7 @@ export class MemoryStore implements Store {
   sessions = new Map<string, SessionPatch>();
   profiles = new Map<string, Profile>();
   settings = new Map<string, Settings>();
-  contacts = new Map<string, (ContactRow & { created_at: string })[]>();
+  contacts = new Map<string, (ContactRow & { created_at: string; queue_requested_at?: string | null })[]>();
   rules = new Map<string, RuleRow[]>();
   events = new Map<string, (SaveEvent & { occurred_at: string })[]>();
   deletedUsers: string[] = [];
@@ -100,11 +100,60 @@ export class MemoryStore implements Store {
     const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
     return [...this.profiles.values()]
       .filter((p) => !maySave(p.subscription_status, p.grace_until))
+      .filter((p) => this.sessions.get(p.id)?.desired === 'on')
       .filter((p) => (this.createdAt.get(p.id) ?? new Date().toISOString()) < cutoff)
       .map((p) => p.id);
   }
   async updateSession(userId: string, patch: SessionPatch) {
     this.sessions.set(userId, { ...this.sessions.get(userId), ...patch });
+  }
+  async getSessionStatus(userId: string) {
+    return (this.sessions.get(userId)?.status ?? null) as SessionStatus | null;
+  }
+  async sessionsToReconcile() {
+    return [...this.sessions.entries()]
+      .filter(([, row]) =>
+        row.desired === 'on' ||
+        row.logout_requested_at != null ||
+        ['connecting', 'pairing', 'connected'].includes(row.status ?? ''),
+      )
+      .map(([user_id, row]) => ({
+        user_id,
+        desired: row.desired ?? 'off',
+        pair_phone: row.pair_phone ?? null,
+        logout_requested_at: row.logout_requested_at ?? null,
+        status: (row.status ?? 'disconnected') as SessionStatus,
+      }));
+  }
+  async queuedContacts() {
+    const out: { user_id: string; phone: string }[] = [];
+    for (const [user_id, rows] of this.contacts) {
+      for (const row of rows) {
+        if (row.queue_requested_at) out.push({ user_id, phone: row.phone });
+      }
+    }
+    return out;
+  }
+  async clearQueueRequest(userId: string, phones: string[]) {
+    for (const row of this.rows(userId)) {
+      if (phones.includes(row.phone)) row.queue_requested_at = null;
+    }
+  }
+  async requestQueue(userId: string, phones: string[] | 'all-pending') {
+    const now = new Date().toISOString();
+    let flagged = 0;
+    for (const row of this.rows(userId)) {
+      const wanted = phones === 'all-pending' ? row.status === 'pending' : phones.includes(row.phone);
+      if (!wanted) continue;
+      if (phones !== 'all-pending' && row.status === 'failed') {
+        row.status = 'pending';
+        row.error = null;
+      }
+      if (row.status !== 'pending') continue;
+      row.queue_requested_at = now;
+      flagged += 1;
+    }
+    return flagged;
   }
   async getPolicy(userId: string): Promise<Policy> {
     return {
@@ -296,6 +345,42 @@ export class FakeSocket implements ManagedSocket {
   sendReceipt() {
     this.visibleCalls.push('sendReceipt');
   }
+}
+
+/**
+ * What the worker's reconcile loop does for a backfill: flag the pending rows,
+ * hand the phones to the saver, clear the flags.
+ *
+ * Tests go through this rather than calling queuePhones directly, so they
+ * exercise the same path production does — including the store-level guards
+ * that decide which rows are eligible at all.
+ */
+export async function queuePending(
+  store: MemoryStore,
+  saver: { queuePhones(phones: readonly string[]): Promise<number> },
+  userId = USER,
+): Promise<number> {
+  await store.requestQueue(userId, 'all-pending');
+  const phones = (await store.queuedContacts())
+    .filter((r) => r.user_id === userId)
+    .map((r) => r.phone);
+  const queued = await saver.queuePhones(phones);
+  await store.clearQueueRequest(userId, phones);
+  return queued;
+}
+
+/** The same, for one person: the Retry button. */
+export async function queueOne(
+  store: MemoryStore,
+  saver: { queuePhones(phones: readonly string[]): Promise<number> },
+  phone: string,
+  userId = USER,
+): Promise<number> {
+  const flagged = await store.requestQueue(userId, [phone]);
+  if (flagged === 0) return 0;
+  const queued = await saver.queuePhones([phone]);
+  await store.clearQueueRequest(userId, [phone]);
+  return queued;
 }
 
 export const msg = (remoteJid: string, pushName?: string | null, extra: object = {}) => ({

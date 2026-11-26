@@ -64,6 +64,11 @@ export interface Env {
    * no admin page.
    */
   adminEmails: string[];
+  /** Which slice of the customers this replica owns. See shard.ts. */
+  replicaIndex: number;
+  replicaCount: number;
+  /** How often a replica brings its sockets in line with what customers asked for. */
+  reconcileSeconds: number;
 }
 
 export function loadEnv(): Env {
@@ -87,6 +92,9 @@ export function loadEnv(): Env {
     resendApiKey: process.env.RESEND_API_KEY?.trim() || undefined,
     emailFrom: process.env.EMAIL_FROM?.trim() || undefined,
     appName: process.env.APP_NAME?.trim() || 'SaveBot',
+    replicaIndex: positiveInt('REPLICA_INDEX', 0),
+    replicaCount: positiveInt('REPLICA_COUNT', 1),
+    reconcileSeconds: positiveInt('RECONCILE_SECONDS', 15),
     adminEmails: (process.env.ADMIN_EMAILS ?? '')
       .split(',')
       .map((email) => email.trim().toLowerCase())

@@ -17,6 +17,8 @@ import { useSupabaseAuthState } from './authState.js';
 import type { KeyRing } from './crypto.js';
 import { errorMessage, log, maskPhone, silentLogger } from './log.js';
 import { userPart } from './naming.js';
+import { assertShard, describeShard, owns, SINGLE } from './shard.js';
+import type { Shard } from './shard.js';
 import { ContactSaver } from './saver.js';
 import type { IncomingContact, IncomingMessage, WaSocketLike } from './saver.js';
 import type { PolicyCache, Store } from './store.js';
@@ -80,6 +82,8 @@ export const baileysSocketFactory: SocketFactory = async (auth) => {
 
 export class SessionManager {
   #live = new Map<string, Live>();
+  #reconcileTimer?: NodeJS.Timeout;
+  #reconciling = false;
 
   constructor(
     private store: Store,
@@ -89,6 +93,8 @@ export class SessionManager {
     private options: {
       /** Encrypts wa_auth: the first key writes, the rest only read. Only tests leave it out. */
       authRing?: KeyRing;
+      /** Which slice of the customers this replica owns. Defaults to all of them. */
+      shard?: Shard;
       /** Called when WhatsApp ends a login the user did not end themselves. */
       onLoggedOut?: (userId: string) => void;
     } = {},
@@ -109,14 +115,146 @@ export class SessionManager {
     return this.#live.has(userId);
   }
 
-  /** On boot: every subscribed user who has a stored login. */
+  /** Reconcile on a timer. One tick runs at a time; a slow one is not stacked. */
+  startReconciling(intervalMs: number): void {
+    const tick = () => {
+      if (this.#reconciling) return;
+      this.#reconciling = true;
+      void this.reconcile()
+        .catch((error) => log.error('reconcile failed', { error: errorMessage(error) }))
+        .finally(() => {
+          this.#reconciling = false;
+        });
+    };
+    this.#reconcileTimer = setInterval(tick, intervalMs);
+    this.#reconcileTimer.unref?.();
+  }
+
+  stopReconciling(): void {
+    if (this.#reconcileTimer) clearInterval(this.#reconcileTimer);
+    this.#reconcileTimer = undefined;
+  }
+
+  /**
+   * Run a reconcile shortly, after an intent row was written.
+   *
+   * Without this a customer would wait up to a full tick for their pairing
+   * code. It is a nudge rather than an await because the request that wrote
+   * the intent has no reason to wait for WhatsApp.
+   */
+  nudge(): void {
+    setTimeout(() => {
+      if (this.#reconciling) return;
+      this.#reconciling = true;
+      void this.reconcile()
+        .catch((error) => log.error('nudged reconcile failed', { error: errorMessage(error) }))
+        .finally(() => {
+          this.#reconciling = false;
+        });
+    }, 250).unref?.();
+  }
+
+  get shard(): Shard {
+    return this.options.shard ?? SINGLE;
+  }
+
+  /** True when this replica is responsible for the user. */
+  ownsUser(userId: string): boolean {
+    return owns(this.shard, userId);
+  }
+
+  /** On boot: every user this replica owns who has a stored login. */
   async bootAll(): Promise<void> {
-    const users = await this.store.usersToBoot();
-    log.info('starting sessions', { count: users.length });
+    assertShard(this.shard);
+    const users = (await this.store.usersToBoot()).filter((id) => this.ownsUser(id));
+    log.info('starting sessions', { count: users.length, shard: describeShard(this.shard) });
     for (const userId of users) {
       await this.start(userId).catch((error) => {
         log.error('could not start session', { userId, error: errorMessage(error) });
       });
+    }
+  }
+
+  /**
+   * Bring this replica's sockets in line with what customers have asked for.
+   *
+   * The HTTP layer no longer opens sockets — it writes intent and returns —
+   * so this is what actually makes linking happen. Safe to call on a timer and
+   * safe to call twice: `start` and `stop` are both idempotent, and every row
+   * not owned by this replica is skipped, which is what keeps two workers from
+   * fighting over one WhatsApp login.
+   */
+  async reconcile(): Promise<void> {
+    let intents;
+    try {
+      intents = await this.store.sessionsToReconcile();
+    } catch (error) {
+      log.error('could not read session intent', { error: errorMessage(error) });
+      return;
+    }
+
+    for (const intent of intents) {
+      if (!this.ownsUser(intent.user_id)) continue;
+      try {
+        if (intent.logout_requested_at) {
+          await this.logout(intent.user_id);
+          continue;
+        }
+        if (intent.desired === 'off') {
+          if (this.#live.has(intent.user_id)) await this.stop(intent.user_id);
+          continue;
+        }
+        // Wanted up. Passing pair_phone every tick is harmless: `start`
+        // returns early unless it is a genuinely different number than the one
+        // the live session is pairing with.
+        await this.start(intent.user_id, intent.pair_phone ?? undefined);
+      } catch (error) {
+        log.error('could not reconcile session', {
+          userId: intent.user_id,
+          error: errorMessage(error),
+        });
+      }
+    }
+
+    await this.#drainQueueRequests();
+  }
+
+  /**
+   * People the customer has asked to have saved now — the backfill button and
+   * the retry button, which are the same request from here.
+   *
+   * The flag is cleared whether or not the saver could take them, so a
+   * customer pressing the button while WhatsApp is down gets nothing queued
+   * rather than a request that fires unexpectedly hours later.
+   */
+  async #drainQueueRequests(): Promise<void> {
+    let rows;
+    try {
+      rows = await this.store.queuedContacts();
+    } catch (error) {
+      log.error('could not read queue requests', { error: errorMessage(error) });
+      return;
+    }
+
+    const byUser = new Map<string, string[]>();
+    for (const row of rows) {
+      if (!this.ownsUser(row.user_id)) continue;
+      const list = byUser.get(row.user_id) ?? [];
+      list.push(row.phone);
+      byUser.set(row.user_id, list);
+    }
+
+    for (const [userId, phones] of byUser) {
+      try {
+        const saver = this.connectedSaver(userId);
+        if (saver) {
+          const queued = await saver.queuePhones(phones);
+          log.info('queued on request', { userId, asked: phones.length, queued });
+        }
+        await this.store.clearQueueRequest(userId, phones);
+      } catch (error) {
+        log.error('could not queue requested contacts', { userId, error: errorMessage(error) });
+      }
     }
   }
 

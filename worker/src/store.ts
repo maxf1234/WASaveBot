@@ -39,6 +39,18 @@ export interface SessionPatch {
   pairing_code?: string | null;
   phone?: string | null;
   last_connected_at?: string;
+  desired?: 'on' | 'off';
+  pair_phone?: string | null;
+  logout_requested_at?: string | null;
+}
+
+/** A session as the reconcile loop reads it: what is wanted, and what to pair with. */
+export interface SessionIntent {
+  user_id: string;
+  desired: 'on' | 'off';
+  pair_phone: string | null;
+  logout_requested_at: string | null;
+  status: SessionStatus;
 }
 
 export interface Settings {
@@ -158,6 +170,23 @@ export interface Store {
 
   // wa_sessions
   updateSession(userId: string, patch: SessionPatch): Promise<void>;
+  /**
+   * The session's state as the owning worker last wrote it. The HTTP layer
+   * reads this instead of asking a socket, so it works on any replica.
+   */
+  getSessionStatus(userId: string): Promise<SessionStatus | null>;
+  /**
+   * Every session with something for a worker to do: wanted up, wanted down
+   * while still up, or waiting to be logged out. Each replica filters this to
+   * the users it owns.
+   */
+  sessionsToReconcile(): Promise<SessionIntent[]>;
+  /** Phones the customer has asked to have saved now, by user. */
+  queuedContacts(): Promise<{ user_id: string; phone: string }[]>;
+  /** Clear the request once it has been queued, so it is not picked up twice. */
+  clearQueueRequest(userId: string, phones: string[]): Promise<void>;
+  /** Ask for these people to be saved. Returns how many rows were flagged. */
+  requestQueue(userId: string, phones: string[] | 'all-pending'): Promise<number>;
 
   // profiles + settings
   getPolicy(userId: string): Promise<Policy>;
@@ -300,7 +329,10 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
       const rows = check(
         await db
           .from('profiles')
-          .select('id, subscription_status, grace_until, created_at')
+          // Only sessions still wanted up: an expired preview already switched
+          // off must not be rewritten on every tick for ever.
+          .select('id, subscription_status, grace_until, created_at, wa_sessions!inner(desired)')
+          .eq('wa_sessions.desired', 'on')
           .lt('created_at', cutoff),
         'list expired previews',
       );
@@ -311,6 +343,79 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
 
     async updateSession(userId, patch) {
       check(await db.from('wa_sessions').update(patch).eq('user_id', userId), 'update wa_sessions');
+    },
+
+    async getSessionStatus(userId) {
+      const row = check(
+        await db.from('wa_sessions').select('status').eq('user_id', userId).maybeSingle(),
+        'read session status',
+      ) as { status: SessionStatus } | null;
+      return row?.status ?? null;
+    },
+
+    async sessionsToReconcile() {
+      const rows = check(
+        await db
+          .from('wa_sessions')
+          .select('user_id, desired, pair_phone, logout_requested_at, status')
+          // Anything wanted up, anything still up that is not wanted, and
+          // anything waiting to be unlinked. A row that is 'off' and already
+          // disconnected has nothing for anyone to do.
+          .or('desired.eq.on,logout_requested_at.not.is.null,status.in.(connecting,pairing,connected)'),
+        'list sessions to reconcile',
+      );
+      return (rows ?? []) as SessionIntent[];
+    },
+
+    async queuedContacts() {
+      const rows = check(
+        await db
+          .from('saved_contacts')
+          .select('user_id, phone')
+          .not('queue_requested_at', 'is', null)
+          .order('queue_requested_at')
+          .limit(2000),
+        'list queued contacts',
+      );
+      return (rows ?? []) as { user_id: string; phone: string }[];
+    },
+
+    async clearQueueRequest(userId, phones) {
+      if (phones.length === 0) return;
+      for (const part of chunk(phones, 100)) {
+        check(
+          await db
+            .from('saved_contacts')
+            .update({ queue_requested_at: null })
+            .eq('user_id', userId)
+            .in('phone', part),
+          'clear queue request',
+        );
+      }
+    },
+
+    async requestQueue(userId, phones) {
+      const now = new Date().toISOString();
+      let q = db.from('saved_contacts').update({ queue_requested_at: now }).eq('user_id', userId);
+      if (phones === 'all-pending') {
+        q = q.eq('status', 'pending');
+      } else {
+        if (phones.length === 0) return 0;
+        // A failed row goes back to pending, so the queue treats it like any
+        // other waiting person rather than needing a separate 'force' path.
+        check(
+          await db
+            .from('saved_contacts')
+            .update({ status: 'pending', error: null })
+            .eq('user_id', userId)
+            .eq('status', 'failed')
+            .in('phone', phones),
+          'reset failed contacts',
+        );
+        q = q.in('phone', phones).eq('status', 'pending');
+      }
+      const rows = check(await q.select('phone'), 'request queue');
+      return rows?.length ?? 0;
     },
 
     async getPolicy(userId) {

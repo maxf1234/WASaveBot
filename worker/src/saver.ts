@@ -187,10 +187,6 @@ export class ContactSaver {
     });
   }
 
-  #pending(): [string, Tracked][] {
-    return [...this.#tracked].filter(([, t]) => t.status === 'pending');
-  }
-
   /** Load the known numbers and today's count. Called once, before the socket opens. */
   async load(): Promise<void> {
     if (this.#loaded) return;
@@ -265,68 +261,82 @@ export class ContactSaver {
     });
   }
 
-  /** Queue every waiting candidate — backfill or held by the cap. Returns how many. */
-  async backfill(): Promise<number> {
-    const { settings, rules } = await this.policy.get(this.userId);
+  /**
+   * Save these specific people now, because the customer asked.
+   *
+   * One method for what used to be two. The backfill button and the retry
+   * button are the same request — put this person in the save queue — and the
+   * only thing that differed was how the list was chosen, which is now the
+   * dashboard's business rather than the saver's. Returns how many were queued.
+   *
+   * Rules still apply: a customer may have added one since the list was
+   * gathered, and silently saving somebody their rules refuse would be worse
+   * than refusing a button press.
+   */
+  async queuePhones(phones: readonly string[]): Promise<number> {
+    const { settings, rules, subscribed } = await this.policy.get(this.userId);
     let queued = 0;
-    for (const [phone, candidate] of this.#pending()) {
+
+    for (const phone of phones) {
       if (this.#queued.has(phone)) continue;
-      // A candidate is still subject to the rules: the customer may have added
-      // one since the backfill list was gathered.
+      // The row, not the in-memory map, decides eligibility. In memory a
+      // failed save is 'live' exactly like a successful one — we hold the
+      // number either way — so checking the map would skip every retry as
+      // "already saved". The store reset this row to pending when the customer
+      // asked; anything else means it was saved, removed or deleted since.
+      const row = await this.store.getContact(this.userId, phone);
+      if (!row || row.status !== 'pending') continue;
+      this.#track(phone, 'pending', { pushName: row.push_name, lid: row.lid });
+      const known = this.#tracked.get(phone);
+
       const verdict = decide(
         { phone, body: '' },
-        // Backfill is an explicit instruction, so the save phrase does not
-        // apply to it — the customer pressed the button for these people.
+        // An explicit request, so the save phrase does not apply: the customer
+        // pressed the button for exactly these people.
         { ...settings, save_mode: 'everyone' },
         rules,
-        { alreadyKnown: false, optedOut: this.#isRemoved(phone), subscribed: true, capped: false },
+        {
+          alreadyKnown: false,
+          optedOut: this.#isRemoved(phone),
+          subscribed,
+          // Not capped: the cap paces what arrives on its own, and a customer
+          // clearing their own backlog by hand is not that. The pacing between
+          // writes still applies.
+          capped: false,
+        },
       );
+
       if (verdict.action !== 'save') {
         await this.#record(verdict.decision, {
           phone,
-          push_name: candidate.pushName,
+          push_name: known?.pushName ?? null,
           matched_prefix: verdict.matchedPrefix ?? null,
           rule_id: verdict.ruleId ?? null,
           detail: verdict.detail ?? null,
         });
         continue;
       }
+
       this.#queued.add(phone);
       this.#jobs.push({
         kind: 'save',
         phone,
         update: true,
-        lid: candidate.lid,
-        pushName: candidate.pushName,
+        // The customer asked for this one by name, so a row already marked
+        // failed is retried rather than skipped as "already handled".
+        force: true,
+        lid: known?.lid ?? null,
+        pushName: known?.pushName ?? null,
         requestedName: null,
-        name: buildName(candidate.pushName, phone, settings),
+        name: buildName(known?.pushName ?? null, phone, settings),
         matchedPrefix: verdict.matchedPrefix,
         ruleId: verdict.ruleId,
       });
       queued += 1;
     }
+
     void this.#run();
     return queued;
-  }
-
-  /** Try a failed contact again, because the user asked. False if there is nothing to retry. */
-  async retry(phone: string): Promise<boolean> {
-    const row = await this.store.getContact(this.userId, phone);
-    if (!row || row.status !== 'failed' || this.#queued.has(phone)) return false;
-    const { settings } = await this.policy.get(this.userId);
-    this.#queued.add(phone);
-    this.#jobs.push({
-      kind: 'save',
-      phone,
-      update: true,
-      force: true,
-      lid: row.lid,
-      pushName: row.push_name,
-      requestedName: null,
-      name: buildName(row.push_name, phone, settings),
-    });
-    void this.#run();
-    return true;
   }
 
   #isTracked(phone: string): boolean {

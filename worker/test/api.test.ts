@@ -45,17 +45,10 @@ function setup(trialDays = 7, adminEmails: string[] = []) {
   store.addUser(USER, 'none');
   store.addUser('other', 'none');
   const policy = new PolicyCache(store, 0);
-  const calls: string[] = [];
-  const sessions = {
-    count: () => 3,
-    start: async (id: string, phone?: string) => void calls.push(`start:${id}${phone ? `:${phone}` : ''}`),
-    stop: async (id: string) => void calls.push(`stop:${id}`),
-    logout: async (id: string) => void calls.push(`logout:${id}`),
-    connectedSaver: (id: string) =>
-      id === 'other'
-        ? undefined
-        : { backfill: async () => 4, retry: async (phone: string) => (calls.push(`retry:${phone}`), phone === '15551230001') },
-  };
+  // The HTTP layer no longer touches sockets, so all it needs is a count and a
+  // nudge. `nudges` stands in for "a reconcile was asked for".
+  const nudges: string[] = [];
+  const sessions = { count: () => 3, nudge: () => void nudges.push('nudge') };
   const stripe = fakeStripe();
   const billing = new Billing(stripe.api, store, policy, sessions, { priceId: 'price_1', trialDays, webUrl: WEB, graceHours: 0 });
   const app = createApp({
@@ -91,7 +84,7 @@ function setup(trialDays = 7, adminEmails: string[] = []) {
       body: payload,
     });
   };
-  return { store, calls, stripe: stripe.state, base, post, webhook };
+  return { store, nudges, stripe: stripe.state, base, post, webhook };
 }
 
 const sub = (status: string, created = 1, end = 1_900_000_000) => ({
@@ -110,43 +103,51 @@ test('health reports live sockets; CORS allows only WEB_URL', async () => {
 });
 
 test('every route except the webhook needs a valid JWT', async () => {
-  const { post, calls } = setup();
+  const { post, store, nudges } = setup();
   for (const path of ['/api/session/start', '/api/session/logout', '/api/billing/checkout', '/api/billing/portal', '/api/account/delete']) {
     assert.equal((await post(path)).status, 401, path);
     assert.equal((await post(path, 'forged')).status, 401, path);
   }
-  assert.deepEqual(calls, []);
+  assert.deepEqual(nudges, [], 'no reconcile was asked for');
+  assert.equal(store.sessions.get(USER)?.desired, undefined, 'and no intent was written');
 });
 
 test('an unsubscribed account may link, so the preview runs on their own chats', async () => {
   // This used to be a 402. Paying to find out whether the product does
   // anything useful is the wrong way round, and the worker refuses to write
   // for an unsubscribed account anyway, so linking is safe to allow.
-  const { post, store, calls } = setup();
+  const { post, store } = setup();
   assert.equal(store.profiles.get(USER)!.subscription_status, 'none', 'setup leaves them unsubscribed');
   assert.equal(
     (await post('/api/session/start', `good:${USER}`, { phone: '+1 (555) 000-9999' })).status,
     200,
   );
-  assert.deepEqual(calls, [`start:${USER}:15550009999`]);
+  assert.equal(store.sessions.get(USER)?.desired, 'on');
+  assert.equal(store.sessions.get(USER)?.pair_phone, '15550009999');
 });
 
 test('session start needs a phone number to pair', async () => {
-  const { post, store, calls } = setup();
+  const { post, store, nudges } = setup();
   store.profiles.get(USER)!.subscription_status = 'trialing';
   assert.equal((await post('/api/session/start', `good:${USER}`)).status, 400, 'no number, nothing stored');
   assert.equal((await post('/api/session/start', `good:${USER}`, { phone: '12345' })).status, 400);
-  assert.deepEqual(calls, []);
+  assert.equal(store.sessions.get(USER)?.desired, undefined, 'a refused request writes no intent');
 
+  // The request writes what the customer wants and returns. It does not open
+  // a socket: the replica that owns this user does that on its next tick.
   assert.equal((await post('/api/session/start', `good:${USER}`, { phone: '+1 (555) 000-9999' })).status, 200);
-  assert.deepEqual(calls, [`start:${USER}:15550009999`]);
+  assert.equal(store.sessions.get(USER)?.desired, 'on');
+  assert.equal(store.sessions.get(USER)?.pair_phone, '15550009999');
+  assert.equal(nudges.length, 1, 'and asks for a reconcile so the code arrives in seconds');
 
   // With a stored login the number is optional.
   await store.setAuth(USER, [['creds', { me: 1 }]]);
   assert.equal((await post('/api/session/start', `good:${USER}`)).status, 200);
-  assert.equal(calls.at(-1), `start:${USER}`);
+  assert.equal(store.sessions.get(USER)?.desired, 'on');
   assert.equal((await post('/api/session/logout', `good:${USER}`)).status, 200);
-  assert.equal(calls.at(-1), `logout:${USER}`);
+  assert.equal(store.sessions.get(USER)?.desired, 'off');
+  assert.ok(store.sessions.get(USER)?.logout_requested_at, 'logout is asked for, not performed here');
+  assert.equal(store.sessions.get(USER)?.pair_phone, null, 'and the number is not kept');
 });
 
 test('checkout creates the customer once, with the price and trial', async () => {
@@ -184,7 +185,7 @@ test('webhook rejects a bad signature and changes nothing', async () => {
 });
 
 test('webhook: checkout completes, subscription lapses, then comes back', async () => {
-  const { webhook, store, stripe, calls } = setup();
+  const { webhook, store, stripe } = setup();
 
   // 1. Paid. No WhatsApp login yet, so no socket is started.
   stripe.subs = [sub('trialing')];
@@ -197,10 +198,12 @@ test('webhook: checkout completes, subscription lapses, then comes back', async 
   assert.equal(profile.stripe_customer_id, 'cus_9');
   assert.equal(profile.subscription_status, 'trialing');
   assert.equal(store.periodEnd.get(USER), new Date(1_900_000_000_000).toISOString());
-  assert.deepEqual(calls, []);
+  assert.equal(store.sessions.get(USER)?.desired, undefined, 'no stored login, so nothing to start');
   assert.equal(store.profiles.get('other')?.subscription_status, 'none', 'nobody else is touched');
 
-  // 2. They link WhatsApp, then the card fails / they cancel: socket closed, login kept.
+  // 2. They link WhatsApp, then the card fails / they cancel. The socket is no
+  // longer closed by billing: an unsubscribed account runs the preview, and
+  // decide() is what stops it writing. The login is kept.
   await store.setAuth(USER, [['creds', { me: 1 }]]);
   stripe.subs = [sub('past_due')];
   await webhook({ type: 'invoice.payment_failed', data: { object: { customer: 'cus_9' } } });
@@ -208,14 +211,14 @@ test('webhook: checkout completes, subscription lapses, then comes back', async 
   stripe.subs = [sub('canceled')];
   await webhook({ type: 'customer.subscription.deleted', data: { object: { customer: 'cus_9' } } });
   assert.equal(profile.subscription_status, 'canceled');
-  assert.deepEqual(calls, [`stop:${USER}`, `stop:${USER}`]);
+  assert.notEqual(store.sessions.get(USER)?.desired, 'off', 'cancelling does not unlink them');
   assert.ok(await store.hasAuth(USER), 'wa_auth survives cancellation');
 
   // 3. Resubscribed: a new subscription next to the cancelled one. Socket restarts, no QR.
   stripe.subs = [sub('canceled', 1), sub('active', 2)];
   await webhook({ type: 'customer.subscription.created', data: { object: { customer: 'cus_9' } } });
   assert.equal(profile.subscription_status, 'active');
-  assert.equal(calls.at(-1), `start:${USER}`);
+  assert.equal(store.sessions.get(USER)?.desired, 'on', 'resubscribing asks for the socket, no new code');
 
   // An event type we do not handle is acknowledged and ignored.
   stripe.subs = [];
@@ -225,29 +228,47 @@ test('webhook: checkout completes, subscription lapses, then comes back', async 
 });
 
 test('account delete logs out, cancels the subscription and deletes the user', async () => {
-  const { post, store, stripe, calls } = setup();
+  const { post, store, stripe } = setup();
   store.profiles.get(USER)!.stripe_customer_id = 'cus_1';
   stripe.subs = [sub('active', 5), sub('canceled', 1)];
   assert.equal((await post('/api/account/delete', `good:${USER}`)).status, 200);
-  assert.deepEqual(calls, [`logout:${USER}`]);
+  assert.ok(store.sessions.get(USER)?.logout_requested_at, 'the device unlink is asked for');
   assert.deepEqual(stripe.cancelled, ['sub_5']);
   assert.deepEqual(store.deletedUsers, [USER]);
 });
 
-test('backfill and retry need a JWT and a connected WhatsApp', async () => {
-  const { post, calls } = setup();
+test('backfill and retry write a queue request for the owning replica', async () => {
+  const { post, store, nudges } = setup();
   assert.equal((await post('/api/contacts/backfill')).status, 401);
   assert.equal((await post('/api/contacts/retry')).status, 401);
-  assert.equal((await post('/api/contacts/backfill', 'good:other')).status, 409);
-  assert.equal((await post('/api/contacts/retry', 'good:other', { phone: '15551230001' })).status, 409);
 
+  // Not connected: refused, rather than flagging rows nobody will pick up.
+  assert.equal((await post('/api/contacts/backfill', `good:${USER}`)).status, 409);
+  assert.equal((await post('/api/contacts/retry', `good:${USER}`, { phone: '15551230001' })).status, 409);
+  store.sessions.get(USER)!.status = 'connected';
+
+  // Two waiting people and one failure, which is what backfill and retry act on.
+  await store.claimContact(USER, { phone: '15551230001', status: 'failed' });
+  await store.claimContact(USER, { phone: '15551230002', status: 'pending' });
+  await store.claimContact(USER, { phone: '15551230003', status: 'pending' });
+
+  // Backfill flags every pending row. It no longer needs a connected WhatsApp
+  // on *this* replica: the flag waits until the owning one picks it up.
   const res = await post('/api/contacts/backfill', `good:${USER}`);
-  assert.deepEqual(await res.json(), { queued: 4 });
+  assert.deepEqual(await res.json(), { queued: 2 });
+
+  // Retry puts a failed row back to pending and flags it.
   assert.equal((await post('/api/contacts/retry', `good:${USER}`, { phone: '15551230001' })).status, 200);
+  const failed = store.rows().find((r) => r.phone === '15551230001')!;
+  assert.equal(failed.status, 'pending');
+  assert.ok(failed.queue_requested_at);
+
+  // Nothing to flag is a 404, which is where the old "unknown number" and
+  // "already saved" guards now live.
   assert.equal((await post('/api/contacts/retry', `good:${USER}`, { phone: '15559999999' })).status, 404);
   assert.equal((await post('/api/contacts/retry', `good:${USER}`, { phone: "1; drop" })).status, 400);
   assert.equal((await post('/api/contacts/retry', `good:${USER}`)).status, 400);
-  assert.deepEqual(calls, ['retry:15551230001', 'retry:15559999999']);
+  assert.equal(nudges.length, 2, 'one nudge per request that wrote something');
 });
 
 
@@ -313,12 +334,7 @@ test('a verified token with no email is never an admin', async () => {
       cancelAll: async () => {},
       handleEvent: async () => {},
     },
-    sessions: {
-      count: () => 0,
-      start: async () => {},
-      logout: async () => {},
-      connectedSaver: () => undefined,
-    },
+    sessions: { count: () => 0 },
     adminEmails: ['', 'boss@example.com'],
   });
   const server = app.listen(0);

@@ -20,11 +20,16 @@ export interface AppDeps {
   constructEvent: (rawBody: Buffer, signature: string) => Stripe.Event;
   store: Store;
   billing: Pick<Billing, 'checkoutUrl' | 'portalUrl' | 'cancelAll' | 'handleEvent'>;
+  /**
+   * Only what the HTTP layer still needs from the worker: a socket count for
+   * /health and the admin page, and a nudge so a reconcile happens in seconds
+   * rather than at the next tick. It no longer opens or closes sockets — those
+   * are intent rows now, so a request landing on a replica that does not own
+   * the user is harmless.
+   */
   sessions: {
     count(): number;
-    start(userId: string, pairPhone?: string): Promise<void>;
-    logout(userId: string): Promise<void>;
-    connectedSaver(userId: string): { backfill(): Promise<number>; retry(phone: string): Promise<boolean> } | undefined;
+    nudge?(): void;
   };
 }
 
@@ -101,7 +106,16 @@ export function createApp(deps: AppDeps): express.Express {
       if (!valid && !(await deps.store.hasAuth(user.id))) {
         throw new HttpError(400, 'Enter your WhatsApp number with the country code, for example +1 555 123 4567');
       }
-      await deps.sessions.start(user.id, valid ? phone : undefined);
+      // Write what they want and return. The replica that owns this customer
+      // picks it up on its next tick and asks WhatsApp for a code; the
+      // dashboard is already polling for it. Nothing in this request waits on
+      // WhatsApp, so a slow WhatsApp is our spinner rather than a timeout.
+      await deps.store.updateSession(user.id, {
+        desired: 'on',
+        logout_requested_at: null,
+        ...(valid ? { pair_phone: phone, status: 'connecting', pairing_code: null } : {}),
+      });
+      deps.sessions.nudge?.();
       res.json({ ok: true });
     }),
   );
@@ -109,30 +123,48 @@ export function createApp(deps: AppDeps): express.Express {
   app.post(
     '/api/session/logout',
     authed(async (_req, res, user) => {
-      await deps.sessions.logout(user.id);
+      await deps.store.updateSession(user.id, {
+        desired: 'off',
+        pair_phone: null,
+        logout_requested_at: new Date().toISOString(),
+      });
+      deps.sessions.nudge?.();
       res.json({ ok: true });
     }),
   );
 
-  // Save the people from existing chats that were found when WhatsApp was linked.
+  // Save the people from existing chats found when WhatsApp was linked, plus
+  // anyone the daily cap held back.
+  // Refused unless the owning worker reports the session connected. Without
+  // this the request would flag the rows, the worker would find no socket and
+  // clear them, and the button would say "queued 5" while nothing happened.
+  // Read from the database rather than a socket, so any replica can answer.
+  const requireConnected = async (userId: string) => {
+    if ((await deps.store.getSessionStatus(userId)) !== 'connected') {
+      throw new HttpError(409, 'Connect WhatsApp first');
+    }
+  };
+
   app.post(
     '/api/contacts/backfill',
     authed(async (_req, res, user) => {
-      const saver = deps.sessions.connectedSaver(user.id);
-      if (!saver) throw new HttpError(409, 'Connect WhatsApp first');
-      res.json({ queued: await saver.backfill() });
+      await requireConnected(user.id);
+      const queued = await deps.store.requestQueue(user.id, 'all-pending');
+      deps.sessions.nudge?.();
+      res.json({ queued });
     }),
   );
 
-  // Try one failed contact again.
+  // Try one contact again. The same request as a backfill, for one person.
   app.post(
     '/api/contacts/retry',
     authed(async (req, res, user) => {
       const phone = (req.body as { phone?: unknown } | undefined)?.phone;
       if (typeof phone !== 'string' || !/^\d{5,20}$/.test(phone)) throw new HttpError(400, 'Unknown contact');
-      const saver = deps.sessions.connectedSaver(user.id);
-      if (!saver) throw new HttpError(409, 'Connect WhatsApp first');
-      if (!(await saver.retry(phone))) throw new HttpError(404, 'Nothing to retry for that contact');
+      await requireConnected(user.id);
+      const queued = await deps.store.requestQueue(user.id, [phone]);
+      if (queued === 0) throw new HttpError(404, 'Nothing to retry for that contact');
+      deps.sessions.nudge?.();
       res.json({ ok: true });
     }),
   );
@@ -193,7 +225,14 @@ export function createApp(deps: AppDeps): express.Express {
   app.post(
     '/api/account/delete',
     authed(async (_req, res, user) => {
-      await deps.sessions.logout(user.id);
+      // Ask for the device to be unlinked before the rows go. The reconcile
+      // may not have run yet when the cascade removes the session row, so the
+      // credentials are deleted here too rather than relied upon.
+      await deps.store.updateSession(user.id, {
+        desired: 'off',
+        logout_requested_at: new Date().toISOString(),
+      });
+      deps.sessions.nudge?.();
       await deps.billing.cancelAll(user.id);
       await deps.store.deleteUser(user.id); // cascades to every table
       res.json({ ok: true });

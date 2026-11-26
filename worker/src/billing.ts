@@ -20,10 +20,15 @@ export interface BillingConfig {
   graceHours: number;
 }
 
-/** What billing needs from the session manager. */
+/**
+ * What billing needs in order to act on a subscription change.
+ *
+ * It writes intent like everything else rather than touching a socket, because
+ * a Stripe webhook arrives at whichever replica the load balancer picked, which
+ * is very unlikely to be the one that owns the customer.
+ */
 export interface SessionControl {
-  start(userId: string): Promise<void>;
-  stop(userId: string): Promise<void>;
+  nudge?(): void;
 }
 
 export class HttpError extends Error {
@@ -165,14 +170,14 @@ export class Billing {
     this.policy.invalidate(userId);
     log.info('subscription synced', { userId, status, ...(graceUntil ? { graceUntil } : {}) });
 
-    if (maySave(status, graceUntil)) {
-      // In good standing, or inside the grace window: resume with the stored
-      // login, no new pairing code.
-      if (await this.store.hasAuth(userId)) await this.sessions.start(userId);
-    } else {
-      // Stop saving, but keep wa_auth so resubscribing just works.
-      await this.sessions.stop(userId);
+    // An unsubscribed account still runs the preview, so a lapsed subscription
+    // no longer closes the socket: decide() is what stops it writing. The
+    // socket only comes down when the free preview window expires, which
+    // maintenance.ts owns.
+    if (maySave(status, graceUntil) && (await this.store.hasAuth(userId))) {
+      await this.store.updateSession(userId, { desired: 'on' });
     }
+    this.sessions.nudge?.();
   }
 
   /**

@@ -105,34 +105,29 @@ test('only the statuses Stripe retries are graceable', () => {
   }
 });
 
-test('maintenance stops the socket once grace has run out, and only once', async () => {
+test('when grace runs out the customer drops to preview, and is not swept again', async () => {
   const store = new MemoryStore();
   store.addUser(USER, 'past_due');
+  store.sessions.set(USER, { status: 'connected', desired: 'on' });
   store.profiles.get(USER)!.grace_until = new Date(Date.now() - 1000).toISOString();
 
-  const stopped: string[] = [];
-  const maintenance = new Maintenance(store, { stop: async (id) => void stopped.push(id) }, {
-    retentionDays: 0,
-  });
+  await new Maintenance(store, {}, { retentionDays: 0 }).runOnce();
 
-  await maintenance.runOnce();
-  assert.deepEqual(stopped, [USER]);
-  // The deadline is cleared, so this user is not swept again on every tick.
-  assert.equal(store.profiles.get(USER)!.grace_until, null);
-
-  await maintenance.runOnce();
-  assert.deepEqual(stopped, [USER], 'not stopped a second time');
+  // Still wanted up: a lapsed customer previews like one who never paid.
+  // maySave() is what stops the writes, the moment the deadline passes.
+  assert.equal(store.sessions.get(USER)!.desired, 'on', 'the socket stays');
+  assert.equal(store.profiles.get(USER)!.grace_until, null, 'and the deadline is cleared');
+  assert.deepEqual(await store.usersWithLapsedGrace(), [], 'so the next tick finds nothing');
 });
 
 test('maintenance leaves a live grace window alone', async () => {
   const store = new MemoryStore();
   store.addUser(USER, 'past_due');
-  store.profiles.get(USER)!.grace_until = new Date(Date.now() + 3_600_000).toISOString();
+  const deadline = new Date(Date.now() + 3_600_000).toISOString();
+  store.profiles.get(USER)!.grace_until = deadline;
 
-  const stopped: string[] = [];
-  await new Maintenance(store, { stop: async (id) => void stopped.push(id) }, { retentionDays: 0 })
-    .runOnce();
-  assert.deepEqual(stopped, [], 'still inside the window');
+  await new Maintenance(store, {}, { retentionDays: 0 }).runOnce();
+  assert.equal(store.profiles.get(USER)!.grace_until, deadline, 'still inside the window');
 });
 
 // ---------------------------------------------------------------- retention
@@ -145,7 +140,7 @@ test('the purge drops rows past the window and keeps the rest', async () => {
   // Age one of them past the window.
   store.eventRows(USER)[0]!.occurred_at = new Date(Date.now() - 100 * 86_400_000).toISOString();
 
-  await new Maintenance(store, { stop: async () => {} }, { retentionDays: 90 }).runOnce();
+  await new Maintenance(store, {}, { retentionDays: 90 }).runOnce();
   assert.equal(store.eventRows(USER).length, 1);
   assert.equal(store.eventRows(USER)[0]!.phone, '2');
 });
@@ -161,7 +156,7 @@ test('the purge runs once a day, not on every tick', async () => {
     },
   });
 
-  const maintenance = new Maintenance(counting, { stop: async () => {} }, { retentionDays: 90 });
+  const maintenance = new Maintenance(counting, {}, { retentionDays: 90 });
   await maintenance.runOnce();
   await maintenance.runOnce();
   await maintenance.runOnce();
@@ -174,13 +169,16 @@ test('a free preview past its window has its socket closed, and keeps its data',
   store.createdAt.set(USER, new Date(Date.now() - 30 * 86_400_000).toISOString());
   await store.recordEvent(USER, { phone: '1', decision: 'unsubscribed' });
 
-  const stopped: string[] = [];
-  await new Maintenance(store, { stop: async (id) => void stopped.push(id) }, {
+  store.sessions.set(USER, { status: 'connected', desired: 'on' });
+  const nudges: string[] = [];
+  await new Maintenance(store, { nudge: () => void nudges.push('n') }, {
     retentionDays: 0,
     freePreviewDays: 14,
   }).runOnce();
 
-  assert.deepEqual(stopped, [USER]);
+  // Intent, not a direct stop: the owning replica closes the socket.
+  assert.equal(store.sessions.get(USER)!.desired, 'off');
+  assert.equal(nudges.length, 1);
   // Only the socket goes. What they built up is the argument for subscribing.
   assert.equal(store.eventRows(USER).length, 1);
   assert.ok(store.settings.get(USER));
@@ -189,27 +187,21 @@ test('a free preview past its window has its socket closed, and keeps its data',
 test('a subscribed account is never swept as an expired preview', async () => {
   const store = new MemoryStore();
   store.addUser(USER, 'active');
+  store.sessions.set(USER, { status: 'connected', desired: 'on' });
   store.createdAt.set(USER, new Date(Date.now() - 1000 * 86_400_000).toISOString());
 
-  const stopped: string[] = [];
-  await new Maintenance(store, { stop: async (id) => void stopped.push(id) }, {
-    retentionDays: 0,
-    freePreviewDays: 14,
-  }).runOnce();
-  assert.deepEqual(stopped, []);
+  await new Maintenance(store, {}, { retentionDays: 0, freePreviewDays: 14 }).runOnce();
+  assert.equal(store.sessions.get(USER)!.desired, 'on');
 });
 
 test('a preview window of zero never expires anybody', async () => {
   const store = new MemoryStore();
   store.addUser(USER, 'none');
+  store.sessions.set(USER, { status: 'connected', desired: 'on' });
   store.createdAt.set(USER, new Date(Date.now() - 1000 * 86_400_000).toISOString());
 
-  const stopped: string[] = [];
-  await new Maintenance(store, { stop: async (id) => void stopped.push(id) }, {
-    retentionDays: 0,
-    freePreviewDays: 0,
-  }).runOnce();
-  assert.deepEqual(stopped, [], 'unlimited is the default');
+  await new Maintenance(store, {}, { retentionDays: 0, freePreviewDays: 0 }).runOnce();
+  assert.equal(store.sessions.get(USER)!.desired, 'on', 'unlimited is the default');
 });
 
 test('retention of zero switches the purge off', async () => {
@@ -218,6 +210,6 @@ test('retention of zero switches the purge off', async () => {
   await store.recordEvent(USER, { phone: '1', decision: 'saved' });
   store.eventRows(USER)[0]!.occurred_at = new Date(Date.now() - 1000 * 86_400_000).toISOString();
 
-  await new Maintenance(store, { stop: async () => {} }, { retentionDays: 0 }).runOnce();
+  await new Maintenance(store, {}, { retentionDays: 0 }).runOnce();
   assert.equal(store.eventRows(USER).length, 1, 'nothing is swept when retention is off');
 });

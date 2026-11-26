@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { buildName, cleanPushName } from '../src/naming.js';
 import { ContactSaver } from '../src/saver.js';
 import { PolicyCache } from '../src/store.js';
-import { defaultSettings, FakeSocket, MemoryStore, msg, USER } from './helpers.js';
+import { defaultSettings, FakeSocket, MemoryStore, msg, queuePending, USER } from './helpers.js';
 
 function setup(opts: { sleeps?: number[] } = {}) {
   const store = new MemoryStore();
@@ -213,7 +213,7 @@ test('people the cap held are saved when the customer asks', async () => {
   // Tomorrow, with budget again: the held people go through the same queue as
   // a backfill, because that is exactly what they now are.
   store.settings.get(USER)!.daily_cap = 10;
-  assert.equal(await saver.backfill(), 2);
+  assert.equal(await queuePending(store, saver), 2);
   await saver.idle();
   assert.equal(sock.saved.length, 4, 'the held pair is written on request');
   assert.equal(store.rows().filter((r) => r.status === 'pending').length, 0);

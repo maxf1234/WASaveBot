@@ -27,9 +27,16 @@ export interface MaintenanceOptions {
   now?: () => Date;
 }
 
-/** What maintenance needs from the session manager. */
+/**
+ * What maintenance needs from the session manager: only a nudge.
+ *
+ * It used to call `stop()` directly. With sessions sharded that is wrong twice
+ * over — the sweep runs on every replica, and most of the users it finds are
+ * owned by a different one — so it writes intent like everything else and the
+ * owning replica acts on it.
+ */
 export interface SessionStop {
-  stop(userId: string): Promise<void>;
+  nudge?(): void;
 }
 
 const DAY = 86_400_000;
@@ -79,20 +86,20 @@ export class Maintenance {
   }
 
   /**
-   * Close the sockets of customers whose grace has run out.
+   * Clear the grace window for customers whose window has run out.
    *
-   * The policy cache already refuses to save for them — `maySave` compares the
-   * deadline on every read — so this is about not holding a WhatsApp socket
-   * open for somebody who is no longer paying, rather than about correctness.
+   * This does not close their socket. A customer whose payment lapsed drops to
+   * the free preview, exactly like one who never paid: still connected, still
+   * shown who would have been saved, writing nothing. `maySave` already stops
+   * the writes the moment the deadline passes; clearing the column only stops
+   * this sweep finding the same user on every tick. Closing the socket is the
+   * free-preview window's job, below, so there is one rule for it.
    */
   async #expireGrace(): Promise<void> {
     const users = await this.store.usersWithLapsedGrace();
     for (const userId of users) {
-      // Clearing it first means a failure below cannot leave this user being
-      // swept on every tick forever.
       await this.store.setGrace(userId, null);
-      await this.sessions.stop(userId);
-      log.info('payment grace expired, saving stopped', { userId });
+      log.info('payment grace expired, dropped to preview', { userId });
     }
   }
 
@@ -106,10 +113,14 @@ export class Maintenance {
   async #expireFreePreviews(): Promise<void> {
     const days = this.options.freePreviewDays ?? 0;
     if (days <= 0) return;
-    for (const userId of await this.store.usersPastFreePreview(days)) {
-      await this.sessions.stop(userId);
-      log.info('free preview expired, socket closed', { userId, days });
+    const expired = await this.store.usersPastFreePreview(days);
+    for (const userId of expired) {
+      // Intent, not a direct stop: the owning replica closes it. The login is
+      // kept, so subscribing later reconnects without a new pairing code.
+      await this.store.updateSession(userId, { desired: 'off' });
+      log.info('free preview expired, socket closing', { userId, days });
     }
+    if (expired.length > 0) this.sessions.nudge?.();
   }
 
   async #purgeDaily(): Promise<void> {

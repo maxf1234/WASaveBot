@@ -81,7 +81,7 @@ stripe listen --forward-to localhost:3000/api/stripe/webhook
      node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
      ```
    - `RESEND_API_KEY` and `EMAIL_FROM` are optional. With both set, a customer is emailed when WhatsApp logs them out. `EMAIL_FROM` must be on a domain verified at resend.com. Without them the worker runs normally and sends no email.
-3. Keep it at **one replica**. Two replicas would open two sockets for the same WhatsApp login and they would knock each other offline. `railway.json` pins `numReplicas: 1`.
+3. Keep `numReplicas` at **1** — see [Scaling past one worker](#scaling-past-one-worker) for how to run more than one.
 4. Generate a public domain. `GET /health` returns `{"ok":true,"sockets":N}`.
 
 ### Web on Vercel
@@ -90,9 +90,66 @@ stripe listen --forward-to localhost:3000/api/stripe/webhook
 2. Add the variables from `web/.env.example`. `VITE_API_URL` is the Railway URL.
 3. Deploy, then put the final Vercel URL into the worker's `WEB_URL` and Supabase's Site URL.
 
+## Scaling past one worker
+
+Every customer's WhatsApp socket used to live in one Node process, because two
+workers holding a socket for the same login knock each other offline —
+WhatsApp treats a second connection from the same credentials as a
+replacement. Sessions are now **sharded**: each worker owns the customers whose
+id hashes into its slot, and ignores everyone else.
+
+**Run more services, not more replicas.** This is the part that is easy to get
+wrong, and getting it wrong causes exactly the failure sharding prevents.
+Replicas of one Railway service share their environment variables, so
+`numReplicas: 2` would give both copies `REPLICA_INDEX=0`. Both would own every
+customer and fight over every login. `railway.json` therefore stays at
+`numReplicas: 1`, and scaling means:
+
+1. Create N services from this repo, each with Root Directory `worker`.
+2. Give all of them the same variables, plus `REPLICA_COUNT=N`.
+3. Give each its own `REPLICA_INDEX`: `0`, `1`, … `N-1`.
+
+The worker refuses to boot with an index outside `0 … N-1`, because a replica
+outside the range would own nobody and those customers would silently stop
+being served.
+
+**Point everything at any one of them.** The HTTP API no longer opens or closes
+sockets. Linking, unlinking, backfill and retry write *intent* rows and return,
+and the worker that owns the customer reconciles them within a few seconds. So
+any service can take any request: `VITE_API_URL` and the Stripe webhook can
+both point at service 0. Billing writes intent the same way, which matters
+because a webhook lands wherever the load balancer sends it.
+
+**Change the count with a full stop, not a rolling deploy.** While services
+are running with different values of `REPLICA_COUNT`, they disagree about who
+owns whom, and for that window some customers have two owners. Stop every
+worker, change the count everywhere, start them again. Changing the count also
+moves most customers to a new owner, so each of those reconnects once with its
+stored login and no new pairing code.
+
+**The hash is pinned by a test.** If `shard.ts` ever changed how it hashes,
+every customer would move at the next deploy and every socket would reconnect
+at once. That might be acceptable, but it should be a decision rather than a
+side effect of an edit, so `shard.test.ts` fails if the value moves.
+
+`test/shard.test.ts` checks the property that makes all of this safe: with two
+real managers reconciling the same intent, no customer is held twice and none
+is held by nobody.
+
 ## Upgrading an existing deployment
 
-`0002` and `0003` are additive, and the ordering matters for one column.
+`0002` to `0006` are additive. Two of them backfill existing rows so that nobody
+notices the upgrade, and both were checked against a database that already had
+customers in it:
+
+- `0002` sets `armed = true` for every existing settings row (below).
+- `0006` sets `desired = 'on'` for every session with a stored login. Without
+  it, every connected customer would be disconnected by the first reconcile,
+  because the new column defaults to `'off'`.
+
+Apply all of them before deploying the worker.
+
+The ordering matters for one column in `0002`.
 
 `settings.armed` defaults to **false**, because a new account should record what
 it would do before it touches a real address book. Every customer who already
@@ -246,6 +303,7 @@ is refused and the worker is not.
 - **Payment grace**: a `past_due` or `unpaid` subscription keeps saving for `PAYMENT_GRACE_HOURS` (72 by default) while Stripe retries the card, so an expiring card does not quietly cost the customer every person who messaged in the meantime. The window starts once per lapse and is not extended by further failures, so a card that keeps failing cannot buy an unbounded free ride; it is cleared the moment the subscription recovers. `canceled` and `incomplete` get no grace — they are over, not retrying. Set the hours to 0 for the old behaviour of stopping instantly.
 - **Activity retention**: `save_events` rows older than `EVENT_RETENTION_DAYS` (90) are swept nightly. There are no rollups underneath, so the raw rows are the whole story, which is why the window is generous. Set it to 0 to keep everything and accept unbounded growth.
 - **Rotating the encryption key** no longer logs everybody out. Put the current key in `WA_AUTH_ENCRYPTION_KEY_PREVIOUS`, the new one in `WA_AUTH_ENCRYPTION_KEY`, and deploy: writes use the new key, reads fall back to the old one, and every session moves across on its own as Baileys saves credentials. Remove the previous key once they have. A session that never reconnects in that window keeps its old ciphertext and has to re-link — the same outcome it would have had before, now limited to the sessions that were idle rather than all of them.
+- **Intent, not calls**: the dashboard's Connect, Disconnect, Save them and Retry buttons write what the customer wants (`wa_sessions.desired`, `logout_requested_at`, `saved_contacts.queue_requested_at`) and return at once. The owning worker reconciles within seconds — each request nudges it — and every `RECONCILE_SECONDS` as a fallback. Nothing in a request waits on WhatsApp, so a slow WhatsApp is a spinner rather than a timed-out request. Backfill and Retry are one mechanism: both put somebody back in the save queue, and the row itself, not the worker's memory, decides whether they are still eligible.
 - **Linking**: the user enters their own WhatsApp number, the worker asks WhatsApp for an 8-character code, and the user types it under Linked devices → Link a device → Link with phone number instead. If nobody enters it before WhatsApp gives up, the session goes back to "Not connected" instead of retrying forever. Pressing Connect again with a different number starts over.
 - **Subscription changes**: every Stripe event triggers a fresh lookup of the customer's subscriptions, so events arriving out of order cannot leave a wrong status.
 - **Invisible to the other person**: the only calls made to WhatsApp are `addOrEditContact` and `removeContact`, both changes to the customer's own contact list. Two tests guard this. One is a blocklist over the source for `sendMessage`, read receipts and presence. The other is an allowlist over the socket interfaces the worker declares — TypeScript only permits calls to what those declare, so auditing them audits every call site, and a new Baileys method cannot slip in just because nobody thought to add it to a blocklist.
