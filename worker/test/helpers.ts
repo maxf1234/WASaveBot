@@ -88,8 +88,19 @@ export class MemoryStore implements Store {
     return Boolean(this.auth.get(userId)?.has('creds'));
   }
   async usersToBoot() {
+    // Subscribed or not: an unsubscribed account is previewing, and the
+    // preview has to survive a restart like anything else.
     return [...this.profiles.values()]
-      .filter((p) => ['active', 'trialing'].includes(p.subscription_status) && this.auth.get(p.id)?.has('creds'))
+      .filter((p) => this.auth.get(p.id)?.has('creds'))
+      .map((p) => p.id);
+  }
+  createdAt = new Map<string, string>();
+  async usersPastFreePreview(days: number) {
+    if (days <= 0) return [];
+    const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+    return [...this.profiles.values()]
+      .filter((p) => !maySave(p.subscription_status, p.grace_until))
+      .filter((p) => (this.createdAt.get(p.id) ?? new Date().toISOString()) < cutoff)
       .map((p) => p.id);
   }
   async updateSession(userId: string, patch: SessionPatch) {

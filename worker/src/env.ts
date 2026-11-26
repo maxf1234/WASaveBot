@@ -46,6 +46,14 @@ export interface Env {
    * the moment the status goes bad.
    */
   paymentGraceHours: number;
+  /**
+   * How many days an unsubscribed account may run the free preview before its
+   * socket is closed. 0 means no limit, which is the default because a preview
+   * that expires is a worse demonstration — but every free account holds a
+   * WhatsApp socket, which is the real per-customer cost, so this is the lever
+   * to reach for when that starts to matter.
+   */
+  freePreviewDays: number;
   /** Optional: without these two the disconnect email is simply not sent. */
   resendApiKey?: string;
   emailFrom?: string;
@@ -69,6 +77,7 @@ export function loadEnv(): Env {
     waAuthEncryptionKeyPrevious: process.env.WA_AUTH_ENCRYPTION_KEY_PREVIOUS?.trim() || undefined,
     eventRetentionDays: positiveInt('EVENT_RETENTION_DAYS', 90),
     paymentGraceHours: positiveInt('PAYMENT_GRACE_HOURS', 72),
+    freePreviewDays: positiveInt('FREE_PREVIEW_DAYS', 0),
     resendApiKey: process.env.RESEND_API_KEY?.trim() || undefined,
     emailFrom: process.env.EMAIL_FROM?.trim() || undefined,
     appName: process.env.APP_NAME?.trim() || 'SaveBot',

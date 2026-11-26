@@ -168,6 +168,50 @@ test('the purge runs once a day, not on every tick', async () => {
   assert.equal(purges, 1, 'three ticks in one day is one purge');
 });
 
+test('a free preview past its window has its socket closed, and keeps its data', async () => {
+  const store = new MemoryStore();
+  store.addUser(USER, 'none');
+  store.createdAt.set(USER, new Date(Date.now() - 30 * 86_400_000).toISOString());
+  await store.recordEvent(USER, { phone: '1', decision: 'unsubscribed' });
+
+  const stopped: string[] = [];
+  await new Maintenance(store, { stop: async (id) => void stopped.push(id) }, {
+    retentionDays: 0,
+    freePreviewDays: 14,
+  }).runOnce();
+
+  assert.deepEqual(stopped, [USER]);
+  // Only the socket goes. What they built up is the argument for subscribing.
+  assert.equal(store.eventRows(USER).length, 1);
+  assert.ok(store.settings.get(USER));
+});
+
+test('a subscribed account is never swept as an expired preview', async () => {
+  const store = new MemoryStore();
+  store.addUser(USER, 'active');
+  store.createdAt.set(USER, new Date(Date.now() - 1000 * 86_400_000).toISOString());
+
+  const stopped: string[] = [];
+  await new Maintenance(store, { stop: async (id) => void stopped.push(id) }, {
+    retentionDays: 0,
+    freePreviewDays: 14,
+  }).runOnce();
+  assert.deepEqual(stopped, []);
+});
+
+test('a preview window of zero never expires anybody', async () => {
+  const store = new MemoryStore();
+  store.addUser(USER, 'none');
+  store.createdAt.set(USER, new Date(Date.now() - 1000 * 86_400_000).toISOString());
+
+  const stopped: string[] = [];
+  await new Maintenance(store, { stop: async (id) => void stopped.push(id) }, {
+    retentionDays: 0,
+    freePreviewDays: 0,
+  }).runOnce();
+  assert.deepEqual(stopped, [], 'unlimited is the default');
+});
+
 test('retention of zero switches the purge off', async () => {
   const store = new MemoryStore();
   store.addUser(USER);

@@ -122,8 +122,19 @@ export interface Store {
   setAuth(userId: string, entries: [key: string, value: unknown | null][]): Promise<void>;
   deleteAuth(userId: string): Promise<void>;
   hasAuth(userId: string): Promise<boolean>;
-  /** Users with an active/trialing subscription AND a stored WhatsApp login. */
+  /**
+   * Every user with a stored WhatsApp login, subscribed or not.
+   *
+   * Unsubscribed accounts are booted too, because they are running the free
+   * preview and it has to survive a redeploy like anything else. Whether they
+   * may actually write is decide()'s business, not the boot list's.
+   */
   usersToBoot(): Promise<string[]>;
+  /**
+   * Unsubscribed accounts whose free preview has run past `days`, measured
+   * from when they signed up. Empty when `days` is 0.
+   */
+  usersPastFreePreview(days: number): Promise<string[]>;
 
   // wa_sessions
   updateSession(userId: string, patch: SessionPatch): Promise<void>;
@@ -249,9 +260,8 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
         const rows = check(
           await db
             .from('wa_auth')
-            .select('user_id, profiles!inner(subscription_status)')
+            .select('user_id')
             .eq('key', 'creds')
-            .in('profiles.subscription_status', ACTIVE_STATUSES)
             .order('user_id')
             .range(from, from + 999),
           'list sessions to boot',
@@ -260,6 +270,21 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
         if ((rows?.length ?? 0) < 1000) break;
       }
       return out;
+    },
+
+    async usersPastFreePreview(days) {
+      if (days <= 0) return [];
+      const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+      const rows = check(
+        await db
+          .from('profiles')
+          .select('id, subscription_status, grace_until, created_at')
+          .lt('created_at', cutoff),
+        'list expired previews',
+      );
+      return (rows ?? [])
+        .filter((r) => !maySave(r.subscription_status as string, r.grace_until as string | null))
+        .map((r) => r.id as string);
     },
 
     async updateSession(userId, patch) {

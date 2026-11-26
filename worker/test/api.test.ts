@@ -116,9 +116,21 @@ test('every route except the webhook needs a valid JWT', async () => {
   assert.deepEqual(calls, []);
 });
 
-test('session start is 402 until subscribed, then needs a phone number to pair', async () => {
+test('an unsubscribed account may link, so the preview runs on their own chats', async () => {
+  // This used to be a 402. Paying to find out whether the product does
+  // anything useful is the wrong way round, and the worker refuses to write
+  // for an unsubscribed account anyway, so linking is safe to allow.
   const { post, store, calls } = setup();
-  assert.equal((await post('/api/session/start', `good:${USER}`, { phone: '+1 555 000 9999' })).status, 402);
+  assert.equal(store.profiles.get(USER)!.subscription_status, 'none', 'setup leaves them unsubscribed');
+  assert.equal(
+    (await post('/api/session/start', `good:${USER}`, { phone: '+1 (555) 000-9999' })).status,
+    200,
+  );
+  assert.deepEqual(calls, [`start:${USER}:15550009999`]);
+});
+
+test('session start needs a phone number to pair', async () => {
+  const { post, store, calls } = setup();
   store.profiles.get(USER)!.subscription_status = 'trialing';
   assert.equal((await post('/api/session/start', `good:${USER}`)).status, 400, 'no number, nothing stored');
   assert.equal((await post('/api/session/start', `good:${USER}`, { phone: '12345' })).status, 400);

@@ -167,6 +167,38 @@ with two users, that neither can read or change the other's rows, that the
 WhatsApp logins are unreachable, that rules are fully editable by their owner
 and invisible to anyone else, and that the activity log cannot be rewritten.
 
+## The free preview
+
+Signing up and linking WhatsApp needs no subscription. An unlinked account that
+has paid nothing runs as a **preview**: every person who messages appears on the
+Activity page with what *would* have happened, and nothing is written to their
+contacts. Subscribing is what turns it into real saving.
+
+That is deliberate as a funnel — the demonstration is the customer's own chats
+rather than a screenshot — and it is also the safest shape, because the preview
+exercises every code path except the one write.
+
+Three things make it honest rather than a tease:
+
+- The subscription check sits **below** the rules, so a number the customer's
+  own rule refuses is reported as refused, not as "subscribe to save them".
+  Promising to save somebody we would have turned away anyway would be a lie in
+  the exact place they are deciding whether to pay.
+- It sits **above** the daily cap, because a preview writes nothing and so has
+  no write budget to spend.
+- Arming without paying does nothing. The web app writes settings straight to
+  Supabase, so `armed` is not a trusted input; the worker is the only thing that
+  writes contacts and it refuses for an unsubscribed account whatever the column
+  says. The switch is disabled on screen as well, but that is courtesy, not the
+  gate.
+
+The cost is real: a free account holds a WhatsApp socket, which is the actual
+per-customer cost and the whole reason for `numReplicas: 1`. `FREE_PREVIEW_DAYS`
+bounds it — after that many days the socket closes while the settings, rules and
+activity stay, so subscribing later picks up where they left off. It defaults to
+0, meaning no limit, because an expiring preview is a worse demonstration; raise
+it off zero when free sockets start to cost more than they earn.
+
 ## Behaviour worth knowing
 
 - **Save modes**: `everyone` saves each new person who messages privately, which is what every existing account does. `phrase` saves only people whose message *starts with* the customer's phrase — anchored deliberately, because "don't save my number" and "did you save my number?" both contain it and neither is a request. In phrase mode the name the sender gives beats their WhatsApp name, and politeness is stripped, so "save my number please" does not file a contact called "please".

@@ -26,7 +26,9 @@ const STYLES: Record<Decision, string> = {
   failed: 'bg-red-50 text-red-700',
   unresolved: 'bg-slate-100 text-slate-600',
   disabled: 'bg-slate-100 text-slate-600',
-  unsubscribed: 'bg-red-50 text-red-700',
+  // Amber, not red: during the free preview this is the normal state and the
+  // whole point of the page, not a fault.
+  unsubscribed: 'bg-amber-50 text-amber-700',
   no_trigger: 'bg-slate-100 text-slate-600',
   not_found: 'bg-slate-100 text-slate-600',
   already_known: 'bg-slate-100 text-slate-600',
@@ -36,6 +38,7 @@ const FILTERS: { value: '' | Decision; label: string }[] = [
   { value: '', label: 'Everything' },
   { value: 'saved', label: 'Saved' },
   { value: 'would_save', label: 'Would have saved' },
+  { value: 'unsubscribed', label: 'Waiting on a subscription' },
   { value: 'blocked_prefix', label: 'Refused by a rule' },
   { value: 'capped', label: 'Held by the limit' },
   { value: 'removed', label: 'Removed on request' },

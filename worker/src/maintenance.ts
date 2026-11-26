@@ -20,6 +20,8 @@ import type { Store } from './store.js';
 
 export interface MaintenanceOptions {
   retentionDays: number;
+  /** 0 disables the limit; an unsubscribed account then previews indefinitely. */
+  freePreviewDays?: number;
   /** How often to look. Grace is checked every tick; the purge once a day. */
   intervalMs?: number;
   now?: () => Date;
@@ -67,6 +69,7 @@ export class Maintenance {
     this.#running = true;
     try {
       await this.#expireGrace();
+      await this.#expireFreePreviews();
       await this.#purgeDaily();
     } catch (error) {
       log.error('maintenance failed', describeError(error));
@@ -90,6 +93,22 @@ export class Maintenance {
       await this.store.setGrace(userId, null);
       await this.sessions.stop(userId);
       log.info('payment grace expired, saving stopped', { userId });
+    }
+  }
+
+  /**
+   * Close the sockets of unsubscribed accounts that have previewed long enough.
+   *
+   * Only the socket goes. Their settings, rules and activity stay, so
+   * subscribing later picks up where they left off — and the activity log they
+   * built up is the argument for subscribing.
+   */
+  async #expireFreePreviews(): Promise<void> {
+    const days = this.options.freePreviewDays ?? 0;
+    if (days <= 0) return;
+    for (const userId of await this.store.usersPastFreePreview(days)) {
+      await this.sessions.stop(userId);
+      log.info('free preview expired, socket closed', { userId, days });
     }
   }
 

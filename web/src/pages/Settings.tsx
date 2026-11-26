@@ -3,8 +3,8 @@ import type { FormEvent } from 'react';
 import { Button, Card, Field, inputClass, Notice, Switch } from '../components/ui';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
-import { supabase } from '../lib/supabase';
-import type { Settings as SettingsRow } from '../lib/supabase';
+import { isSubscribed, supabase } from '../lib/supabase';
+import type { Profile, Settings as SettingsRow } from '../lib/supabase';
 
 const SAMPLE_NAME = 'Dana Levi';
 const SAMPLE_PHONE = '15551234821';
@@ -13,18 +13,21 @@ export function Settings() {
   const { user } = useAuth();
   const userId = user!.id;
   const [form, setForm] = useState<SettingsRow | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
   const [confirm, setConfirm] = useState('');
   const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
-    supabase
-      .from('settings')
-      .select('*')
-      .eq('user_id', userId)
-      .maybeSingle()
-      .then(({ data }) => setForm(data as SettingsRow | null));
+    void (async () => {
+      const [settings, profileRow] = await Promise.all([
+        supabase.from('settings').select('*').eq('user_id', userId).maybeSingle(),
+        supabase.from('profiles').select('*').eq('id', userId).maybeSingle(),
+      ]);
+      setForm(settings.data as SettingsRow | null);
+      setProfile(profileRow.data as Profile | null);
+    })();
   }, [userId]);
 
   if (!form) return <p className="text-slate-500">Loading…</p>;
@@ -44,6 +47,9 @@ export function Settings() {
     removePhrase.length >= 3 && removePhrase.length <= 64 &&
     savePhrase.toLowerCase() !== removePhrase.toLowerCase();
   const valid = templateOk && prefix.length > 0 && capOk && phrasesOk;
+  // The real gate is in the worker, which refuses to write for an unsubscribed
+  // account however `armed` is set. This only keeps the screen honest.
+  const subscribed = isSubscribed(profile);
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -104,20 +110,36 @@ export function Settings() {
     <>
       <Card title="Saving">
         <div className="space-y-5">
-          {!form.armed && (
+          {!subscribed ? (
             <Notice>
-              <strong>Watch-only.</strong> Everyone who messages you is recorded on the Activity page
-              and nothing is written to your contacts. Turn this on once the list looks right.
+              <strong>Free preview.</strong> Everyone who messages you is listed on the Activity page
+              with what would have happened, and nothing is written to your contacts. Subscribe to
+              start saving them for real.
             </Notice>
+          ) : (
+            !form.armed && (
+              <Notice>
+                <strong>Watch-only.</strong> Everyone who messages you is recorded on the Activity
+                page and nothing is written to your contacts. Turn this on once the list looks right.
+              </Notice>
+            )
           )}
           <div className="flex items-center justify-between gap-4">
             <div>
               <div className="text-sm font-medium">Save contacts for real</div>
               <div className="text-sm text-slate-500">
-                Off records what would have happened without touching your address book.
+                {subscribed
+                  ? 'Off records what would have happened without touching your address book.'
+                  : 'Needs a subscription. Until then every message is recorded and nothing is saved.'}
               </div>
             </div>
-            <Switch label="Save contacts for real" large checked={form.armed} onChange={(n) => void setArmed(n)} />
+            <Switch
+              label="Save contacts for real"
+              large
+              checked={form.armed && subscribed}
+              disabled={!subscribed}
+              onChange={(n) => void setArmed(n)}
+            />
           </div>
         </div>
       </Card>

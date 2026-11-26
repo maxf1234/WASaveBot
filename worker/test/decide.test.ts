@@ -217,6 +217,49 @@ test('no subscription and saving switched off are told apart', () => {
   );
 });
 
+// ---------------------------------------------------------------- free preview
+
+test('an unsubscribed account previews rather than being turned away', () => {
+  const verdict = decide({ phone: PHONE, body: 'hi' }, settings(), noRules, facts({ subscribed: false }));
+  assert.equal(verdict.decision, 'unsubscribed');
+  assert.equal(verdict.action, 'none', 'nothing is written');
+  assert.equal(verdict.silent, false, 'but they can see who it would have been');
+  assert.match(verdict.detail ?? '', /subscribe/);
+});
+
+test('the preview is honest about numbers a rule would have refused', () => {
+  // The subscription check sits below the rules for this reason: telling
+  // somebody to subscribe in order to save a number their own rule refuses
+  // would be a lie in the exact place they are deciding whether to pay.
+  const rules: PrefixRule[] = [{ id: 1, kind: 'block', prefix: '1555' }];
+  const verdict = decide({ phone: PHONE, body: 'hi' }, settings(), rules, facts({ subscribed: false }));
+  assert.equal(verdict.decision, 'blocked_prefix');
+});
+
+test('a preview is not limited by the daily cap, because it writes nothing', () => {
+  const verdict = decide(
+    { phone: PHONE, body: 'hi' },
+    settings(),
+    noRules,
+    facts({ subscribed: false, capped: true }),
+  );
+  assert.equal(verdict.decision, 'unsubscribed', 'not capped');
+});
+
+test('arming without paying still writes nothing', () => {
+  // The web app writes settings straight to Supabase, so `armed` is not a
+  // trusted input. The worker is the only thing that writes contacts, and this
+  // is where it refuses.
+  const verdict = decide(
+    { phone: PHONE, body: 'hi' },
+    settings({ armed: true }),
+    noRules,
+    facts({ subscribed: false }),
+  );
+  assert.notEqual(verdict.action, 'save');
+  assert.equal(verdict.decision, 'unsubscribed');
+});
+
 // ---------------------------------------------------------------- the property
 
 test('an unarmed account never writes to an address book, under any settings', () => {

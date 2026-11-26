@@ -48,7 +48,10 @@ const billing = new Billing(stripe, store, policy, sessions, {
   graceHours: env.paymentGraceHours,
 });
 
-const maintenance = new Maintenance(store, sessions, { retentionDays: env.eventRetentionDays });
+const maintenance = new Maintenance(store, sessions, {
+  retentionDays: env.eventRetentionDays,
+  freePreviewDays: env.freePreviewDays,
+});
 
 const app = createApp({
   webUrl: env.webUrl,

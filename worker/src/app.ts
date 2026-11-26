@@ -77,9 +77,14 @@ export function createApp(deps: AppDeps): express.Express {
   app.post(
     '/api/session/start',
     authed(async (req, res, user) => {
-      if (!(await deps.store.getPolicy(user.id)).subscribed) {
-        throw new HttpError(402, 'Subscribe to connect WhatsApp');
-      }
+      // No subscription needed to link. An unsubscribed account runs as a
+      // preview: the worker records who it would have saved and writes
+      // nothing, which is a far better demonstration than any screenshot
+      // because it is the customer's own chats. decide() is what enforces
+      // that, so setting `armed` without paying achieves nothing.
+      //
+      // The cost of this is real — a free account holds a WhatsApp socket —
+      // and FREE_WATCH_DAYS is the lever that bounds it.
       // The user's own number, with country code: "+1 (555) 123-4567" -> "15551234567".
       const raw = (req.body as { phone?: unknown } | undefined)?.phone;
       const phone = typeof raw === 'string' ? raw.replace(/\D/g, '').replace(/^00/, '') : '';

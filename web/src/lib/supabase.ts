@@ -115,7 +115,7 @@ export const DECISION_TEXT: Record<Decision, string> = {
   no_trigger: 'did not use your phrase',
   capped: 'held — daily limit reached',
   disabled: 'saving was switched off',
-  unsubscribed: 'no active subscription',
+  unsubscribed: 'would have been saved — subscribe to save them',
   unresolved: 'WhatsApp gave no number',
   failed: 'could not be saved',
 };

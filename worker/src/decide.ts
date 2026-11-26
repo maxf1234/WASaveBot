@@ -152,13 +152,6 @@ export function decide(
   // the save goes ahead; the detail records that this is a second time.
   const revived = facts.optedOut;
 
-  if (!facts.subscribed) {
-    return verdict('unsubscribed', 'save', {
-      requestedName: parsed.name,
-      detail: 'no active subscription',
-    });
-  }
-
   if (!settings.enabled) {
     return verdict('disabled', 'save', {
       requestedName: parsed.name,
@@ -175,6 +168,21 @@ export function decide(
       matchedPrefix: prefix.matchedPrefix,
       ruleId: prefix.ruleId,
       detail: prefix.byDefault ? 'no rule matched, and this account refuses by default' : undefined,
+    });
+  }
+
+  // Below the rules on purpose. Somebody with no subscription is running the
+  // free preview, and the preview is only useful if it is honest about who
+  // *would* have been saved — telling them to subscribe in order to save a
+  // number their own rule refuses would be a lie in the one place they are
+  // deciding whether to pay. Above the cap on purpose too: a preview writes
+  // nothing, so there is no write budget for it to spend.
+  if (!facts.subscribed) {
+    return verdict('unsubscribed', 'save', {
+      requestedName: parsed.name,
+      matchedPrefix: prefix.matchedPrefix,
+      ruleId: prefix.ruleId,
+      detail: 'preview only: subscribe to start saving',
     });
   }
 
