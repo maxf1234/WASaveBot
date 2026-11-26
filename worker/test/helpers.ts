@@ -3,6 +3,7 @@ import type { ManagedSocket } from '../src/sessions.js';
 import type {
   ContactRow, Policy, Profile, RuleRow, SaveEvent, SessionPatch, Settings, Store,
 } from '../src/store.js';
+import { maySave } from '../src/store.js';
 import type { PrefixRule, RuleKind } from '../src/rules.js';
 
 export const USER = 'user-1';
@@ -96,7 +97,10 @@ export class MemoryStore implements Store {
   }
   async getPolicy(userId: string): Promise<Policy> {
     return {
-      subscribed: ['active', 'trialing'].includes(this.profiles.get(userId)?.subscription_status ?? ''),
+      subscribed: maySave(
+        this.profiles.get(userId)?.subscription_status,
+        this.profiles.get(userId)?.grace_until,
+      ),
       settings: { ...(this.settings.get(userId) ?? defaultSettings()) },
       rules: this.ruleRows(userId)
         .filter((r) => r.enabled)
@@ -139,6 +143,33 @@ export class MemoryStore implements Store {
   async setSubscription(userId: string, status: string, periodEnd: string | null) {
     this.profiles.get(userId)!.subscription_status = status;
     this.periodEnd.set(userId, periodEnd);
+  }
+  grace = new Map<string, string | null>();
+  async setGrace(userId: string, until: string | null) {
+    this.grace.set(userId, until);
+    const profile = this.profiles.get(userId);
+    if (profile) profile.grace_until = until;
+  }
+  async usersWithLapsedGrace() {
+    const now = new Date().toISOString();
+    return [...this.profiles.values()]
+      .filter(
+        (p) =>
+          ['past_due', 'unpaid'].includes(p.subscription_status) &&
+          p.grace_until != null &&
+          p.grace_until < now,
+      )
+      .map((p) => p.id);
+  }
+  async purgeEvents(retentionDays: number) {
+    const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+    let removed = 0;
+    for (const [userId, rows] of this.events) {
+      const kept = rows.filter((e) => e.occurred_at >= cutoff);
+      removed += rows.length - kept.length;
+      this.events.set(userId, kept);
+    }
+    return removed;
   }
   async deleteUser(userId: string) {
     this.deletedUsers.push(userId);

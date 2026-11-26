@@ -15,4 +15,5 @@ q() { psql -v ON_ERROR_STOP=1 -q -h "$dir" -p "$port" -U postgres -d postgres -f
 q "$here/supabase_shim.sql"
 # Every migration in order, so the test also proves they apply to each other.
 for m in "$here"/../migrations/*.sql; do q "$m"; done
+q "$here/claim.sql"
 q "$here/rls.sql"

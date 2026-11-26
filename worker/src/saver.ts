@@ -64,6 +64,15 @@ export interface IncomingContact {
   notify?: string | null;
 }
 
+/** The three states a number can be in, mirroring its saved_contacts row. */
+type TrackedStatus = 'live' | 'pending' | 'removed';
+
+interface Tracked {
+  status: TrackedStatus;
+  pushName: string | null;
+  lid: string | null;
+}
+
 type JobKind = 'save' | 'remove';
 
 interface Job {
@@ -105,12 +114,20 @@ export function bodyOf(message: IncomingMessage): string {
 }
 
 export class ContactSaver {
-  /** Numbers with a live saved_contacts row: saved, existing, failed or unresolved. */
-  #known = new Set<string>();
-  /** Numbers whose row is 'removed'. They asked not to be held; a fresh request revives them. */
-  #optedOut = new Set<string>();
-  /** People from existing chats or held by the cap, waiting for the user to say "save them". */
-  #candidates = new Map<string, { pushName: string | null; lid: string | null }>();
+  /**
+   * What we know about each number, mirroring its saved_contacts row.
+   *
+   * One map rather than three sets. The three states are mutually exclusive —
+   * a row cannot be both live and removed — and keeping them in separate sets
+   * meant every transition had to remember to delete from the other two. Here
+   * a transition is one assignment and the illegal combinations cannot be
+   * expressed at all.
+   *
+   *   live    — saved, existing, failed or unresolved: we hold this number
+   *   pending — from an existing chat, or held by the cap; not saved yet
+   *   removed — they asked not to be held, and only a fresh request revives them
+   */
+  #tracked = new Map<string, Tracked>();
   /** Push names seen in the history sync, by phone, for naming candidates. */
   #pushNames = new Map<string, string>();
   /** Phones waiting in the queue. */
@@ -139,17 +156,48 @@ export class ContactSaver {
     this.#now = options.now ?? (() => new Date());
   }
 
+  #state(phone: string): TrackedStatus | undefined {
+    return this.#tracked.get(phone)?.status;
+  }
+
+  /** We hold this number: it must not be saved again. */
+  #isLive(phone: string): boolean {
+    return this.#state(phone) === 'live';
+  }
+
+  #isRemoved(phone: string): boolean {
+    return this.#state(phone) === 'removed';
+  }
+
+  #isPending(phone: string): boolean {
+    return this.#state(phone) === 'pending';
+  }
+
+  /** Move a number to a state, keeping whatever we already knew about it. */
+  #track(
+    phone: string,
+    status: TrackedStatus,
+    extra: { pushName?: string | null; lid?: string | null } = {},
+  ): void {
+    const existing = this.#tracked.get(phone);
+    this.#tracked.set(phone, {
+      status,
+      pushName: extra.pushName ?? existing?.pushName ?? null,
+      lid: extra.lid ?? existing?.lid ?? null,
+    });
+  }
+
+  #pending(): [string, Tracked][] {
+    return [...this.#tracked].filter(([, t]) => t.status === 'pending');
+  }
+
   /** Load the known numbers and today's count. Called once, before the socket opens. */
   async load(): Promise<void> {
     if (this.#loaded) return;
     for (const row of await this.store.loadContacts(this.userId)) {
-      if (row.status === 'pending') {
-        this.#candidates.set(row.phone, { pushName: row.push_name, lid: row.lid });
-      } else if (row.status === 'removed') {
-        this.#optedOut.add(row.phone);
-      } else {
-        this.#known.add(row.phone);
-      }
+      const status: TrackedStatus =
+        row.status === 'pending' ? 'pending' : row.status === 'removed' ? 'removed' : 'live';
+      this.#track(row.phone, status, { pushName: row.push_name, lid: row.lid });
     }
     const now = this.#now();
     this.#day = utcDay(now);
@@ -198,9 +246,8 @@ export class ContactSaver {
           // A push-name entry. These cover group members too, so on its own it
           // is not a candidate; it only names one.
           this.#pushNames.set(phone, contact.notify);
-          const candidate = this.#candidates.get(phone);
-          if (candidate && !candidate.pushName) {
-            candidate.pushName = contact.notify;
+          if (this.#isPending(phone) && !this.#tracked.get(phone)!.pushName) {
+            this.#track(phone, 'pending', { pushName: contact.notify });
             await this.store.updateContact(this.userId, phone, { push_name: contact.notify });
           }
           continue;
@@ -210,7 +257,7 @@ export class ContactSaver {
         if (this.#isSelf(phone)) continue;
         const lid = isLidJid(contact.lid) ? contact.lid : isLidJid(contact.id) ? contact.id : null;
         const pushName = this.#pushNames.get(phone) ?? null;
-        this.#candidates.set(phone, { pushName, lid });
+        this.#track(phone, 'pending', { pushName, lid });
         await this.store.claimContact(this.userId, {
           phone, lid, push_name: pushName, status: 'pending',
         });
@@ -222,8 +269,8 @@ export class ContactSaver {
   async backfill(): Promise<number> {
     const { settings, rules } = await this.policy.get(this.userId);
     let queued = 0;
-    for (const [phone, candidate] of this.#candidates) {
-      if (this.#known.has(phone) || this.#queued.has(phone)) continue;
+    for (const [phone, candidate] of this.#pending()) {
+      if (this.#queued.has(phone)) continue;
       // A candidate is still subject to the rules: the customer may have added
       // one since the backfill list was gathered.
       const verdict = decide(
@@ -232,7 +279,7 @@ export class ContactSaver {
         // apply to it — the customer pressed the button for these people.
         { ...settings, save_mode: 'everyone' },
         rules,
-        { alreadyKnown: false, optedOut: this.#optedOut.has(phone), subscribed: true, capped: false },
+        { alreadyKnown: false, optedOut: this.#isRemoved(phone), subscribed: true, capped: false },
       );
       if (verdict.action !== 'save') {
         await this.#record(verdict.decision, {
@@ -283,7 +330,7 @@ export class ContactSaver {
   }
 
   #isTracked(phone: string): boolean {
-    return this.#known.has(phone) || this.#candidates.has(phone) || this.#optedOut.has(phone);
+    return this.#tracked.has(phone);
   }
 
   /** The user's own number, reached from another of their devices. Not a contact. */
@@ -338,8 +385,8 @@ export class ContactSaver {
     // finds out rather than wondering.
     if (!phone) {
       const key = lidKey(userPart(lid ?? '') || (lid ?? remoteJid));
-      if (this.#known.has(key)) return;
-      this.#known.add(key);
+      if (this.#isLive(key)) return;
+      this.#track(key, 'live', { lid, pushName: message.pushName ?? null });
       await this.store.claimContact(this.userId, {
         phone: key, lid, push_name: message.pushName ?? null, status: 'unresolved',
       });
@@ -358,8 +405,8 @@ export class ContactSaver {
       settings,
       rules,
       {
-        alreadyKnown: this.#known.has(phone),
-        optedOut: this.#optedOut.has(phone),
+        alreadyKnown: this.#isLive(phone),
+        optedOut: this.#isRemoved(phone),
         subscribed,
         capped: this.#savedToday >= settings.daily_cap,
       },
@@ -367,7 +414,10 @@ export class ContactSaver {
 
     // A sender we could not resolve earlier now has a number: drop the placeholder.
     const stale = lid ? lidKey(userPart(lid)) : null;
-    if (stale && this.#known.delete(stale)) await this.store.deleteContact(this.userId, stale);
+    if (stale && this.#isLive(stale)) {
+      this.#tracked.delete(stale);
+      await this.store.deleteContact(this.userId, stale);
+    }
 
     await this.#apply(verdict, {
       phone,
@@ -403,8 +453,8 @@ export class ContactSaver {
       // Held by the cap: kept as a candidate so the customer can press
       // "Save them" rather than the person being silently dropped and lost if
       // they never message again — which is what the old queue did.
-      if (verdict.decision === 'capped' && !this.#candidates.has(phone)) {
-        this.#candidates.set(phone, { pushName, lid });
+      if (verdict.decision === 'capped' && !this.#isPending(phone)) {
+        this.#track(phone, 'pending', { pushName, lid });
         await this.store.claimContact(this.userId, {
           phone, lid, push_name: pushName, status: 'pending',
         });
@@ -423,7 +473,7 @@ export class ContactSaver {
       kind: verdict.action,
       phone,
       // A candidate or an opted-out person already has a row to update.
-      update: this.#candidates.has(phone) || this.#optedOut.has(phone),
+      update: this.#isPending(phone) || this.#isRemoved(phone),
       lid,
       pushName,
       requestedName: verdict.requestedName ?? null,
@@ -447,11 +497,11 @@ export class ContactSaver {
     if (!name) return;
 
     const phone = await this.#phoneOf(contact);
-    if (!phone || this.#known.has(phone)) return;
+    if (!phone || this.#isLive(phone)) return;
 
-    this.#known.add(phone);
-    this.#optedOut.delete(phone);
-    if (this.#candidates.delete(phone)) {
+    const wasPending = this.#isPending(phone);
+    this.#track(phone, 'live', { pushName: contact.notify ?? null });
+    if (wasPending) {
       // A backfill candidate the user has since saved by hand.
       await this.store.updateContact(this.userId, phone, { status: 'existing', saved_name: name });
       return;
@@ -497,15 +547,14 @@ export class ContactSaver {
         }
 
         // Switched off, unsubscribed, or saved by hand while it waited.
-        const done = this.#known.has(job.phone) && !job.force;
+        const done = this.#isLive(job.phone) && !job.force;
         if (!settings.enabled || !subscribed || done) continue;
 
         await this.#pause();
-        if (this.#known.has(job.phone) && !job.force) continue;
+        if (this.#isLive(job.phone) && !job.force) continue;
         // Claimed before the call, so the contact event WhatsApp echoes back
         // for our own save is not mistaken for one the user made by hand.
-        this.#known.add(job.phone);
-        this.#optedOut.delete(job.phone);
+        this.#track(job.phone, 'live', { pushName: job.pushName, lid: job.lid });
         await this.#save(job, settings.save_to_phone);
       }
     } catch (error) {
@@ -521,9 +570,9 @@ export class ContactSaver {
     this.#jobs = [];
     this.#queued.clear();
     for (const job of held) {
-      if (this.#known.has(job.phone)) continue;
-      if (!this.#candidates.has(job.phone)) {
-        this.#candidates.set(job.phone, { pushName: job.pushName, lid: job.lid });
+      if (this.#isLive(job.phone)) continue;
+      if (!this.#isPending(job.phone)) {
+        this.#track(job.phone, 'pending', { pushName: job.pushName, lid: job.lid });
         await this.store.claimContact(this.userId, {
           phone: job.phone, lid: job.lid, push_name: job.pushName, status: 'pending',
         });
@@ -575,7 +624,7 @@ export class ContactSaver {
       status: failure ? ('failed' as const) : ('saved' as const),
       error: failure || null,
     };
-    this.#candidates.delete(job.phone);
+    this.#track(job.phone, 'live', { pushName: job.pushName, lid: job.lid });
     if (job.update) await this.store.updateContact(this.userId, job.phone, row);
     else await this.store.claimContact(this.userId, row);
 
@@ -625,9 +674,7 @@ export class ContactSaver {
       return;
     }
 
-    this.#known.delete(job.phone);
-    this.#candidates.delete(job.phone);
-    this.#optedOut.add(job.phone);
+    this.#track(job.phone, 'removed', { pushName: job.pushName, lid: job.lid });
     await this.store.updateContact(this.userId, job.phone, {
       status: 'removed', error: null, saved_name: null,
     });

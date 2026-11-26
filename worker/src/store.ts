@@ -14,6 +14,24 @@ export const ACTIVE_STATUSES = ['active', 'trialing'];
 export const isActive = (status: string | null | undefined): boolean =>
   ACTIVE_STATUSES.includes(status ?? '');
 
+/**
+ * Statuses Stripe will keep retrying, and so the only ones worth a grace
+ * period. 'canceled', 'incomplete' and 'incomplete_expired' are final or never
+ * started: extending those would be giving the service away, not absorbing a
+ * payment hiccup.
+ */
+export const GRACE_STATUSES = ['past_due', 'unpaid'];
+export const isGraceable = (status: string | null | undefined): boolean =>
+  GRACE_STATUSES.includes(status ?? '');
+
+/** Whether this customer may save right now, grace included. */
+export const maySave = (
+  status: string | null | undefined,
+  graceUntil: string | null | undefined,
+  now = new Date(),
+): boolean =>
+  isActive(status) || (isGraceable(status) && Boolean(graceUntil) && new Date(graceUntil!) > now);
+
 export type SessionStatus = 'disconnected' | 'pairing' | 'connecting' | 'connected' | 'logged_out';
 
 export interface SessionPatch {
@@ -49,6 +67,7 @@ export interface Profile {
   email: string | null;
   stripe_customer_id: string | null;
   subscription_status: string;
+  grace_until?: string | null;
 }
 
 /**
@@ -115,6 +134,12 @@ export interface Store {
   findProfileByCustomer(customerId: string): Promise<Profile | null>;
   setCustomerId(userId: string, customerId: string): Promise<void>;
   setSubscription(userId: string, status: string, periodEnd: string | null): Promise<void>;
+  /** Start or clear a payment grace window. */
+  setGrace(userId: string, until: string | null): Promise<void>;
+  /** Customers whose grace has run out and who should stop saving. */
+  usersWithLapsedGrace(): Promise<string[]>;
+  /** Nightly sweep. Returns how many rows went. */
+  purgeEvents(retentionDays: number): Promise<number>;
   deleteUser(userId: string): Promise<void>;
 
   // save_events
@@ -174,7 +199,7 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
   const db: SupabaseClient = createClient(url, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
-  const PROFILE = 'id, email, stripe_customer_id, subscription_status';
+  const PROFILE = 'id, email, stripe_customer_id, subscription_status, grace_until';
 
   return {
     async getAuth(userId, keys) {
@@ -243,7 +268,7 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
 
     async getPolicy(userId) {
       const [profile, settings, rules] = await Promise.all([
-        db.from('profiles').select('subscription_status').eq('id', userId).maybeSingle(),
+        db.from('profiles').select('subscription_status, grace_until').eq('id', userId).maybeSingle(),
         db.from('settings').select('*').eq('user_id', userId).maybeSingle(),
         // Only the enabled ones: a disabled rule is invisible to the matcher,
         // which is cheaper and clearer than filtering at match time.
@@ -252,7 +277,12 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
       const p = check(profile, 'read profile');
       const s = check(settings, 'read settings');
       return {
-        subscribed: isActive(p?.subscription_status as string | undefined),
+        // Grace included: a card Stripe is still retrying must not cost the
+        // customer the contacts who message in the meantime.
+        subscribed: maySave(
+          p?.subscription_status as string | undefined,
+          p?.grace_until as string | null | undefined,
+        ),
         settings: { ...DEFAULT_SETTINGS, ...(s ?? {}) } as Settings,
         rules: (check(rules, 'read rules') ?? []) as PrefixRule[],
       };
@@ -339,6 +369,34 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
           .eq('id', userId),
         'save subscription',
       );
+    },
+
+    async setGrace(userId, until) {
+      check(
+        await db.from('profiles').update({ grace_until: until }).eq('id', userId),
+        'set grace',
+      );
+    },
+
+    async usersWithLapsedGrace() {
+      const rows = check(
+        await db
+          .from('profiles')
+          .select('id')
+          .in('subscription_status', GRACE_STATUSES)
+          .lt('grace_until', new Date().toISOString()),
+        'list lapsed grace',
+      );
+      return (rows ?? []).map((r) => r.id as string);
+    },
+
+    async purgeEvents(retentionDays) {
+      const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+      const rows = check(
+        await db.from('save_events').delete().lt('occurred_at', cutoff).select('id'),
+        'purge events',
+      );
+      return rows?.length ?? 0;
     },
 
     async deleteUser(userId) {

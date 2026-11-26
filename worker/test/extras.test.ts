@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DisconnectReason } from 'baileys';
 import { useSupabaseAuthState } from '../src/authState.js';
-import { open, parseKey, seal } from '../src/crypto.js';
+import { keyRing, open, parseKey, seal } from '../src/crypto.js';
 import { createMailer } from '../src/email.js';
 import { ContactSaver } from '../src/saver.js';
 import { SessionManager } from '../src/sessions.js';
@@ -32,7 +32,7 @@ test('encryption: round trip, wrong key and tampering are rejected, bad keys ref
 
 test('wa_auth holds only ciphertext, and a restarted worker with the key reads it back', async () => {
   const store = new MemoryStore();
-  const first = await useSupabaseAuthState(store, USER, KEY);
+  const first = await useSupabaseAuthState(store, USER, keyRing(KEY));
   first.state.creds.me = { id: '15550009999:3@s.whatsapp.net' };
   await first.saveCreds();
   await first.state.keys.set({ 'pre-key': { '1': { public: Buffer.from('pub'), private: Buffer.from('priv') } } });
@@ -42,12 +42,12 @@ test('wa_auth holds only ciphertext, and a restarted worker with the key reads i
   }
   assert.equal(JSON.stringify([...store.auth.get(USER)!]).includes('15550009999'), false);
 
-  const second = await useSupabaseAuthState(store, USER, KEY);
+  const second = await useSupabaseAuthState(store, USER, keyRing(KEY));
   assert.deepEqual(second.state.creds.me, { id: '15550009999:3@s.whatsapp.net' });
   assert.deepEqual(second.state.creds.noiseKey, first.state.creds.noiseKey);
   assert.equal((await second.state.keys.get('pre-key', ['1']))['1']?.private.toString(), 'priv');
 
-  await assert.rejects(useSupabaseAuthState(store, USER, parseKey('cd'.repeat(32))));
+  await assert.rejects(useSupabaseAuthState(store, USER, keyRing(parseKey('cd'.repeat(32)))));
   await assert.rejects(useSupabaseAuthState(store, USER), /no key/);
 });
 
@@ -152,7 +152,7 @@ test('the disconnect email goes out once when WhatsApp logs the user out', async
     new PolicyCache(store, 0),
     (auth) => (sockets.push(new FakeSocket(auth.creds)), sockets.at(-1)!),
     undefined,
-    { authKey: KEY, onLoggedOut: (id) => void loggedOut.push(id) },
+    { authRing: keyRing(KEY), onLoggedOut: (id) => void loggedOut.push(id) },
   );
   await manager.start(USER, '15550009999');
   assert.equal(manager.connectedSaver(USER), undefined, 'not connected yet');

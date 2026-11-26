@@ -57,7 +57,7 @@ function setup(trialDays = 7) {
         : { backfill: async () => 4, retry: async (phone: string) => (calls.push(`retry:${phone}`), phone === '15551230001') },
   };
   const stripe = fakeStripe();
-  const billing = new Billing(stripe.api, store, policy, sessions, { priceId: 'price_1', trialDays, webUrl: WEB });
+  const billing = new Billing(stripe.api, store, policy, sessions, { priceId: 'price_1', trialDays, webUrl: WEB, graceHours: 0 });
   const app = createApp({
     webUrl: WEB,
     verifyToken: async (token) => {

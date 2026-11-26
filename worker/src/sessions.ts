@@ -14,6 +14,7 @@ import makeWASocket, {
 } from 'baileys';
 import type { AuthenticationState, WAVersion } from 'baileys';
 import { useSupabaseAuthState } from './authState.js';
+import type { KeyRing } from './crypto.js';
 import { errorMessage, log, maskPhone, silentLogger } from './log.js';
 import { userPart } from './naming.js';
 import { ContactSaver } from './saver.js';
@@ -86,8 +87,8 @@ export class SessionManager {
     private makeSocket: SocketFactory = baileysSocketFactory,
     private setTimer: (fn: () => void, ms: number) => NodeJS.Timeout = setTimeout,
     private options: {
-      /** Encrypts wa_auth. Only tests leave it out. */
-      authKey?: Buffer;
+      /** Encrypts wa_auth: the first key writes, the rest only read. Only tests leave it out. */
+      authRing?: KeyRing;
       /** Called when WhatsApp ends a login the user did not end themselves. */
       onLoggedOut?: (userId: string) => void;
     } = {},
@@ -192,7 +193,7 @@ export class SessionManager {
   }
 
   async #open(userId: string, live: Live): Promise<void> {
-    const { state, saveCreds } = await useSupabaseAuthState(this.store, userId, this.options.authKey);
+    const { state, saveCreds } = await useSupabaseAuthState(this.store, userId, this.options.authRing);
     const sock = await this.makeSocket(state);
     if (live.closing) {
       sock.end(undefined);

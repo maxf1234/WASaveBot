@@ -9,13 +9,15 @@
 
 import type Stripe from 'stripe';
 import { log } from './log.js';
-import { isActive } from './store.js';
+import { isActive, isGraceable, maySave } from './store.js';
 import type { PolicyCache, Store } from './store.js';
 
 export interface BillingConfig {
   priceId: string;
   trialDays: number;
   webUrl: string;
+  /** How long a past_due or unpaid subscription keeps saving. 0 stops at once. */
+  graceHours: number;
 }
 
 /** What billing needs from the session manager. */
@@ -158,15 +160,46 @@ export class Billing {
     const sub = pick(subs.data);
     const status = sub?.status ?? 'none';
     await this.store.setSubscription(userId, status, sub ? periodEnd(sub) : null);
-    this.policy.invalidate(userId);
-    log.info('subscription synced', { userId, status });
 
-    if (isActive(status)) {
-      // Back in good standing: resume with the stored login, no new QR.
+    const graceUntil = await this.#reconcileGrace(userId, status);
+    this.policy.invalidate(userId);
+    log.info('subscription synced', { userId, status, ...(graceUntil ? { graceUntil } : {}) });
+
+    if (maySave(status, graceUntil)) {
+      // In good standing, or inside the grace window: resume with the stored
+      // login, no new pairing code.
       if (await this.store.hasAuth(userId)) await this.sessions.start(userId);
     } else {
       // Stop saving, but keep wa_auth so resubscribing just works.
       await this.sessions.stop(userId);
     }
+  }
+
+  /**
+   * Open, keep or close the grace window for this status.
+   *
+   * Started once and not extended: each later `invoice.payment_failed` for the
+   * same lapse must not push the deadline out again, or a card that keeps
+   * failing would buy an unbounded free ride. Cleared as soon as the
+   * subscription recovers, so the next lapse gets a fresh window.
+   */
+  async #reconcileGrace(userId: string, status: string): Promise<string | null> {
+    const profile = await this.store.getProfile(userId);
+    const existing = profile?.grace_until ?? null;
+
+    if (!isGraceable(status)) {
+      if (existing) await this.store.setGrace(userId, null);
+      return null;
+    }
+    if (this.config.graceHours <= 0) {
+      if (existing) await this.store.setGrace(userId, null);
+      return null;
+    }
+    if (existing) return existing;
+
+    const until = new Date(Date.now() + this.config.graceHours * 3_600_000).toISOString();
+    await this.store.setGrace(userId, until);
+    log.info('payment grace started', { userId, status, until });
+    return until;
   }
 }
