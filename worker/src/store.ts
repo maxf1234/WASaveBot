@@ -24,13 +24,19 @@ export const GRACE_STATUSES = ['past_due', 'unpaid'];
 export const isGraceable = (status: string | null | undefined): boolean =>
   GRACE_STATUSES.includes(status ?? '');
 
-/** Whether this customer may save right now, grace included. */
+/**
+ * Whether this customer may save right now: a live Stripe subscription, a
+ * payment still inside its grace window, or Pro granted by an admin.
+ */
 export const maySave = (
   status: string | null | undefined,
   graceUntil: string | null | undefined,
+  proGranted: boolean | null | undefined = false,
   now = new Date(),
 ): boolean =>
-  isActive(status) || (isGraceable(status) && Boolean(graceUntil) && new Date(graceUntil!) > now);
+  Boolean(proGranted) ||
+  isActive(status) ||
+  (isGraceable(status) && Boolean(graceUntil) && new Date(graceUntil!) > now);
 
 export type SessionStatus = 'disconnected' | 'pairing' | 'connecting' | 'connected' | 'logged_out';
 
@@ -80,6 +86,8 @@ export interface Profile {
   stripe_customer_id: string | null;
   subscription_status: string;
   grace_until?: string | null;
+  /** Pro given by an admin. Billing never writes it. */
+  pro_granted?: boolean;
 }
 
 /**
@@ -123,6 +131,7 @@ export interface AdminRow {
   email: string | null;
   subscription_status: string;
   grace_until: string | null;
+  pro_granted: boolean;
   created_at: string;
   session_status: string | null;
   session_phone: string | null;
@@ -202,6 +211,8 @@ export interface Store {
   purgeEvents(retentionDays: number): Promise<number>;
   /** One row per customer, for the operator's admin page. */
   adminOverview(limit: number): Promise<AdminRow[]>;
+  /** Grant or take away admin-given Pro. False if there is no such customer. */
+  setProGranted(userId: string, granted: boolean): Promise<boolean>;
   deleteUser(userId: string): Promise<void>;
 
   // save_events
@@ -261,7 +272,7 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
   const db: SupabaseClient = createClient(url, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
-  const PROFILE = 'id, email, stripe_customer_id, subscription_status, grace_until';
+  const PROFILE = 'id, email, stripe_customer_id, subscription_status, grace_until, pro_granted';
 
   return {
     async getAuth(userId, keys) {
@@ -331,13 +342,13 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
           .from('profiles')
           // Only sessions still wanted up: an expired preview already switched
           // off must not be rewritten on every tick for ever.
-          .select('id, subscription_status, grace_until, created_at, wa_sessions!inner(desired)')
+          .select('id, subscription_status, grace_until, pro_granted, created_at, wa_sessions!inner(desired)')
           .eq('wa_sessions.desired', 'on')
           .lt('created_at', cutoff),
         'list expired previews',
       );
       return (rows ?? [])
-        .filter((r) => !maySave(r.subscription_status as string, r.grace_until as string | null))
+        .filter((r) => !maySave(r.subscription_status as string, r.grace_until as string | null, r.pro_granted as boolean))
         .map((r) => r.id as string);
     },
 
@@ -420,7 +431,7 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
 
     async getPolicy(userId) {
       const [profile, settings, rules] = await Promise.all([
-        db.from('profiles').select('subscription_status, grace_until').eq('id', userId).maybeSingle(),
+        db.from('profiles').select('subscription_status, grace_until, pro_granted').eq('id', userId).maybeSingle(),
         db.from('settings').select('*').eq('user_id', userId).maybeSingle(),
         // Only the enabled ones: a disabled rule is invisible to the matcher,
         // which is cheaper and clearer than filtering at match time.
@@ -434,6 +445,7 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
         subscribed: maySave(
           p?.subscription_status as string | undefined,
           p?.grace_until as string | null | undefined,
+          p?.pro_granted as boolean | undefined,
         ),
         settings: { ...DEFAULT_SETTINGS, ...(s ?? {}) } as Settings,
         rules: (check(rules, 'read rules') ?? []) as PrefixRule[],
@@ -562,6 +574,14 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
           .limit(limit),
         'read admin overview',
       ) ?? []) as AdminRow[];
+    },
+
+    async setProGranted(userId, granted) {
+      const rows = check(
+        await db.from('profiles').update({ pro_granted: granted }).eq('id', userId).select('id'),
+        'set pro',
+      );
+      return (rows?.length ?? 0) > 0;
     },
 
     async deleteUser(userId) {

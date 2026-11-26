@@ -311,6 +311,52 @@ test('an admin sees every customer and the totals', async () => {
   assert.ok(overview.customers.some((c) => c.user_id === USER));
 });
 
+test('an admin can grant and take away Pro, and Stripe cannot undo it', async () => {
+  const { post, store, nudges } = setup(7, ['boss@example.com']);
+  store.addUser('boss', 'active');
+  store.profiles.get('boss')!.email = 'boss@example.com';
+  assert.equal((await store.getPolicy(USER)).subscribed, false);
+
+  const grant = await post('/api/admin/pro', 'good:boss', { userId: USER, pro: true });
+  assert.equal(grant.status, 200);
+  assert.equal((await store.getPolicy(USER)).subscribed, true, 'Pro without Stripe');
+  assert.ok(nudges.length > 0, 'the owning replica is told');
+
+  // A Stripe sync only ever writes subscription_status.
+  await store.setSubscription(USER, 'canceled', null);
+  assert.equal((await store.getPolicy(USER)).subscribed, true, 'a webhook does not take it away');
+
+  const overview = (await (await post('/api/admin/overview', 'good:boss')).json()) as {
+    customers: { user_id: string; pro_granted: boolean }[];
+  };
+  assert.equal(overview.customers.find((c) => c.user_id === USER)?.pro_granted, true);
+
+  assert.equal((await post('/api/admin/pro', 'good:boss', { userId: USER, pro: false })).status, 200);
+  assert.equal((await store.getPolicy(USER)).subscribed, false);
+});
+
+test('granting Pro brings back a socket an expired preview closed', async () => {
+  const { post, store } = setup(7, ['boss@example.com']);
+  store.addUser('boss', 'active');
+  store.profiles.get('boss')!.email = 'boss@example.com';
+  store.auth.set(USER, new Map([['creds', '{}']]));
+  store.sessions.set(USER, { status: 'disconnected', desired: 'off' });
+
+  await post('/api/admin/pro', 'good:boss', { userId: USER, pro: true });
+  assert.equal(store.sessions.get(USER)?.desired, 'on');
+});
+
+test('only an admin can change Pro, and bad requests are refused', async () => {
+  const { post, store } = setup(7, ['boss@example.com']);
+  store.addUser('boss', 'active');
+  store.profiles.get('boss')!.email = 'boss@example.com';
+
+  assert.equal((await post('/api/admin/pro', `good:${USER}`, { userId: USER, pro: true })).status, 403);
+  assert.equal(store.profiles.get(USER)?.pro_granted ?? false, false, 'a customer cannot grant themselves Pro');
+  assert.equal((await post('/api/admin/pro', 'good:boss', { userId: USER, pro: 'yes' })).status, 400);
+  assert.equal((await post('/api/admin/pro', 'good:boss', { userId: 'nobody', pro: true })).status, 404);
+});
+
 test('the admin email match ignores case and surrounding space', async () => {
   const { post } = setup(7, ['  BOSS@Example.com ']);
   assert.deepEqual(await (await post('/api/admin/check', 'good:boss')).json(), { admin: true });

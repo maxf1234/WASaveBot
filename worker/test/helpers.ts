@@ -99,7 +99,7 @@ export class MemoryStore implements Store {
     if (days <= 0) return [];
     const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
     return [...this.profiles.values()]
-      .filter((p) => !maySave(p.subscription_status, p.grace_until))
+      .filter((p) => !maySave(p.subscription_status, p.grace_until, p.pro_granted))
       .filter((p) => this.sessions.get(p.id)?.desired === 'on')
       .filter((p) => (this.createdAt.get(p.id) ?? new Date().toISOString()) < cutoff)
       .map((p) => p.id);
@@ -160,6 +160,7 @@ export class MemoryStore implements Store {
       subscribed: maySave(
         this.profiles.get(userId)?.subscription_status,
         this.profiles.get(userId)?.grace_until,
+        this.profiles.get(userId)?.pro_granted,
       ),
       settings: { ...(this.settings.get(userId) ?? defaultSettings()) },
       rules: this.ruleRows(userId)
@@ -231,6 +232,12 @@ export class MemoryStore implements Store {
     }
     return removed;
   }
+  async setProGranted(userId: string, granted: boolean) {
+    const profile = this.profiles.get(userId);
+    if (!profile) return false;
+    profile.pro_granted = granted;
+    return true;
+  }
   async adminOverview(limit: number) {
     return [...this.profiles.values()].slice(0, limit).map((p) => {
       const rows = this.rows(p.id);
@@ -242,6 +249,7 @@ export class MemoryStore implements Store {
         email: p.email,
         subscription_status: p.subscription_status,
         grace_until: p.grace_until ?? null,
+        pro_granted: p.pro_granted ?? false,
         created_at: this.createdAt.get(p.id) ?? new Date().toISOString(),
         session_status: session?.status ?? null,
         session_phone: session?.phone ?? null,

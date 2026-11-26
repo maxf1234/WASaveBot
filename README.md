@@ -152,7 +152,7 @@ is held by nobody.
 
 ## Upgrading an existing deployment
 
-`0002` to `0006` are additive. Two of them backfill existing rows so that nobody
+`0002` to `0007` are additive. Two of them backfill existing rows so that nobody
 notices the upgrade, and both were checked against a database that already had
 customers in it:
 
@@ -298,6 +298,10 @@ underlying policies would still apply if the grants were ever loosened. A view
 in Postgres runs with its owner's rights by default, which would have been a way
 straight past every policy in `0002`. `supabase/tests/rls.sql` checks a customer
 is refused and the worker is not.
+
+### Giving someone Pro
+
+Each customer row has a **Give Pro** / **Remove Pro** button. Pro given this way works without Stripe and is stored separately from the Stripe subscription, so no webhook can undo it. It takes effect within about 15 seconds; giving Pro also reconnects a socket an expired free preview had closed. Removing it drops the customer to the free preview.
 
 ## Behaviour worth knowing
 

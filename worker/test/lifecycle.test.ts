@@ -95,6 +95,20 @@ test('maySave covers active, trialing and a live grace window', () => {
   assert.equal(maySave('canceled', future), false);
   assert.equal(maySave('incomplete', future), false);
   assert.equal(maySave('none', future), false);
+  // Admin-granted Pro beats any Stripe status.
+  assert.equal(maySave('none', null, true), true);
+  assert.equal(maySave('canceled', null, true), true);
+});
+
+test('an account with granted Pro is never swept as an expired preview', async () => {
+  const store = new MemoryStore();
+  store.addUser(USER, 'none');
+  store.profiles.get(USER)!.pro_granted = true;
+  store.sessions.set(USER, { status: 'connected', desired: 'on' });
+  store.createdAt.set(USER, new Date(Date.now() - 1000 * 86_400_000).toISOString());
+
+  await new Maintenance(store, {}, { retentionDays: 0, freePreviewDays: 14 }).runOnce();
+  assert.equal(store.sessions.get(USER)!.desired, 'on');
 });
 
 test('only the statuses Stripe retries are graceable', () => {
