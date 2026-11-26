@@ -70,7 +70,12 @@ export function Billing() {
       {error && <Notice kind="error">{error}</Notice>}
 
       <Card title="Your plan">
-        {!billingEnabled ? (
+        {profile?.pro_granted ? (
+          <p className="text-sm text-slate-600">
+            You have <span className="font-medium">Pro</span>, given to you by the SaveBot team. There is nothing to
+            pay.
+          </p>
+        ) : !billingEnabled ? (
           <p className="text-sm text-slate-600">
             Billing isn't set up yet. You can connect WhatsApp and use the free preview, which shows who would be
             saved without saving anyone.

@@ -217,7 +217,7 @@ export function createApp(deps: AppDeps): express.Express {
         customers,
         totals: {
           customers: customers.length,
-          subscribed: customers.filter((c) => maySave(c.subscription_status, c.grace_until)).length,
+          subscribed: customers.filter((c) => maySave(c.subscription_status, c.grace_until, c.pro_granted)).length,
           connected: customers.filter((c) => c.session_status === 'connected').length,
           armed: customers.filter((c) => c.armed === true).length,
           saved: customers.reduce((sum, c) => sum + c.saved_count, 0),
@@ -225,6 +225,33 @@ export function createApp(deps: AppDeps): express.Express {
         },
         sockets: deps.sessions.count(),
       });
+    }),
+  );
+
+  /**
+   * Give a customer Pro, or take it away, without Stripe.
+   *
+   * Stored in its own column, so a later Stripe webhook cannot undo it. The
+   * effect reaches the saver within the policy cache's few seconds. Granting
+   * also asks for their socket back up, in case a free preview had expired and
+   * closed it; taking Pro away leaves the socket alone, and they drop to the
+   * preview like a lapsed subscriber.
+   */
+  app.post(
+    '/api/admin/pro',
+    authed(async (req, res, user) => {
+      if (!isAdmin(user)) throw new HttpError(403, 'Not an admin');
+      const body = (req.body ?? {}) as { userId?: unknown; pro?: unknown };
+      if (typeof body.userId !== 'string' || !body.userId || typeof body.pro !== 'boolean') {
+        throw new HttpError(400, 'Send { userId, pro: true | false }');
+      }
+      if (!(await deps.store.setProGranted(body.userId, body.pro))) throw new HttpError(404, 'No such customer');
+      if (body.pro && (await deps.store.hasAuth(body.userId))) {
+        await deps.store.updateSession(body.userId, { desired: 'on' });
+      }
+      deps.sessions.nudge?.();
+      log.info('admin changed pro', { userId: body.userId, pro: body.pro, by: user.id });
+      res.json({ ok: true, pro: body.pro });
     }),
   );
 

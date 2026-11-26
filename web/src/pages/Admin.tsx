@@ -21,6 +21,7 @@ interface Customer {
   email: string | null;
   subscription_status: string;
   grace_until: string | null;
+  pro_granted: boolean;
   created_at: string;
   session_status: string | null;
   session_phone: string | null;
@@ -79,7 +80,7 @@ function Pill({ text, tone }: { text: string; tone: 'good' | 'warn' | 'bad' | 'f
  * because they are being charged for nothing.
  */
 function health(c: Customer): { text: string; tone: 'good' | 'warn' | 'bad' | 'flat' } {
-  const paying = ACTIVE.includes(c.subscription_status);
+  const paying = c.pro_granted || ACTIVE.includes(c.subscription_status);
   const inGrace = Boolean(c.grace_until && new Date(c.grace_until) > new Date());
 
   if (paying && c.session_status !== 'connected') return { text: 'paying, not connected', tone: 'bad' };
@@ -96,6 +97,23 @@ export function Admin() {
   const [data, setData] = useState<Overview | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [changing, setChanging] = useState('');
+
+  const setPro = async (c: Customer, pro: boolean) => {
+    if (!pro && !window.confirm(`Take Pro away from ${c.email ?? c.user_id}? They drop to the free preview.`)) return;
+    setChanging(c.user_id);
+    try {
+      await api('/api/admin/pro', { userId: c.user_id, pro });
+      setData((d) =>
+        d && { ...d, customers: d.customers.map((x) => (x.user_id === c.user_id ? { ...x, pro_granted: pro } : x)) },
+      );
+      setError('');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setChanging('');
+    }
+  };
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -114,7 +132,7 @@ export function Admin() {
   }, [load]);
 
   if (loading && !data) return <p className="text-slate-500">Loading…</p>;
-  if (error) return <Notice kind="error">{error}</Notice>;
+  if (error && !data) return <Notice kind="error">{error}</Notice>;
   if (!data) return null;
 
   const { totals } = data;
@@ -126,6 +144,7 @@ export function Admin() {
 
   return (
     <div className="space-y-4">
+      {error && <Notice kind="error">{error}</Notice>}
       <Card title="Everyone" action={<Button variant="secondary" onClick={() => void load()}>Refresh</Button>}>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           {[
@@ -178,7 +197,17 @@ export function Admin() {
                       <Pill text={h.text} tone={h.tone} />
                     </td>
                     <td className="px-4 py-2 text-xs sm:px-2">
-                      {c.subscription_status}
+                      <div className="flex items-center gap-2">
+                        {c.pro_granted ? <Pill text="Pro (granted)" tone="good" /> : c.subscription_status}
+                        <button
+                          type="button"
+                          disabled={changing === c.user_id}
+                          onClick={() => void setPro(c, !c.pro_granted)}
+                          className="rounded border border-slate-200 px-1.5 py-0.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                        >
+                          {c.pro_granted ? 'Remove Pro' : 'Give Pro'}
+                        </button>
+                      </div>
                       {c.grace_until && new Date(c.grace_until) > new Date() && (
                         <div className="text-amber-700">grace until {when(c.grace_until)}</div>
                       )}

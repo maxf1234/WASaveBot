@@ -108,6 +108,9 @@ begin
   update profiles set subscription_status = 'active';
   get diagnostics n = row_count;
   assert n = 0, 'A cannot make themselves a subscriber';
+  update profiles set pro_granted = true;
+  get diagnostics n = row_count;
+  assert n = 0, 'A cannot grant themselves Pro';
   update wa_sessions set status = 'connected';
   get diagnostics n = row_count;
   assert n = 0, 'A cannot write wa_sessions';

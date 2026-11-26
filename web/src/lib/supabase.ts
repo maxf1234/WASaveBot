@@ -14,6 +14,8 @@ export interface Profile {
   email: string | null;
   subscription_status: string;
   current_period_end: string | null;
+  /** Pro given by an admin, independent of Stripe. */
+  pro_granted?: boolean;
 }
 
 export interface Settings {
@@ -82,7 +84,9 @@ export interface SavedContact {
 }
 
 export const isSubscribed = (profile: Profile | null | undefined): boolean =>
-  profile?.subscription_status === 'active' || profile?.subscription_status === 'trialing';
+  Boolean(profile?.pro_granted) ||
+  profile?.subscription_status === 'active' ||
+  profile?.subscription_status === 'trialing';
 
 /**
  * Turn what somebody types into the digits a rule is stored as.
