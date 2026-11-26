@@ -88,7 +88,7 @@ test('pairing code, open and creds.update are written to wa_sessions / wa_auth',
   assert.equal(sockets.length, 1);
 });
 
-test('a worker restart reconnects every active user with the stored login, no new code', async () => {
+test('a worker restart reconnects every user with a stored login, no new code', async () => {
   const { store, manager: before, sockets: s1 } = setup();
   store.addUser('lapsed', 'canceled');
   store.addUser('never-linked', 'active');
@@ -106,12 +106,18 @@ test('a worker restart reconnects every active user with the stored login, no ne
     return sock;
   });
   await after.bootAll();
-  assert.equal(sockets.length, 1, 'only the subscribed user with a stored login');
+  // Both stored logins come back, including the lapsed account's: an
+  // unsubscribed account is running the preview, and whether it may write is
+  // decide()'s business rather than the boot list's. 'never-linked' has no
+  // stored login, so there is nothing to reconnect.
+  assert.equal(sockets.length, 2, 'every stored login, subscribed or not');
   assert.deepEqual(sockets[0]!.authState.creds.me, { id: '15550009999:3@s.whatsapp.net' }, 'same identity: no pairing needed');
   sockets[0]!.ev.emit('connection.update', { connection: 'open' });
   await tick();
   assert.deepEqual(sockets[0]!.pairingRequests, [], 'no code was requested');
-  assert.ok(after.has(USER) && !after.has('lapsed') && !after.has('never-linked'));
+  assert.ok(after.has(USER), 'the subscribed user is back');
+  assert.ok(after.has('lapsed'), 'and the lapsed one, previewing rather than saving');
+  assert.ok(!after.has('never-linked'), 'but not one that never linked');
 });
 
 test('logged out by WhatsApp: login deleted, status logged_out, no reconnect', async () => {
@@ -246,5 +252,41 @@ test('the worker source never calls anything the other person could see', () => 
   const forbidden = /\.(sendMessage|readMessages|sendReceipt|sendReceipts|sendPresenceUpdate|presenceSubscribe|chatModify)\s*\(/;
   for (const file of readdirSync(dir)) {
     assert.doesNotMatch(readFileSync(new URL(file, dir), 'utf8'), forbidden, file);
+  }
+});
+
+test('the socket surface the worker declares is only ever contact writes', () => {
+  // The test above is a blocklist, and a blocklist cannot anticipate the next
+  // visible call Baileys adds. This is the allowlist that can: TypeScript only
+  // permits the worker to call what these two interfaces declare, so auditing
+  // the interfaces audits every call site in the worker at once.
+  const source = readFileSync(new URL('../src/saver.ts', import.meta.url), 'utf8')
+    + readFileSync(new URL('../src/sessions.ts', import.meta.url), 'utf8');
+
+  // Method names declared on WaSocketLike / ManagedSocket, i.e. `name(args):`.
+  const declared = new Set<string>();
+  for (const block of source.matchAll(/interface (?:WaSocketLike|ManagedSocket)[^{]*\{([\s\S]*?)\n\}/g)) {
+    for (const member of block[1]!.matchAll(/^\s{2}(\w+)\s*\(/gm)) declared.add(member[1]!);
+  }
+
+  const allowed = new Set([
+    // The only two writes to WhatsApp, both to the user's own contact list and
+    // both invisible to the other person.
+    'addOrEditContact',
+    'removeContact',
+    // Connection management, which sends nothing into any chat.
+    'end',
+    'logout',
+    'requestPairingCode',
+  ]);
+
+  assert.ok(declared.size > 0, 'the interfaces should have been found');
+  assert.deepEqual(
+    [...declared].filter((name) => !allowed.has(name)).sort(),
+    [],
+    'a new socket method reached the worker: check it cannot be seen by the other person, then allow it here',
+  );
+  for (const required of ['addOrEditContact', 'removeContact']) {
+    assert.ok(declared.has(required), `${required} should still be declared`);
   }
 });

@@ -10,24 +10,30 @@
 
 import { BufferJSON, initAuthCreds, proto } from 'baileys';
 import type { AuthenticationCreds, AuthenticationState, SignalDataTypeMap } from 'baileys';
-import { isSealed, open, seal } from './crypto.js';
+import { isSealed, openWithRing, seal } from './crypto.js';
+import type { KeyRing } from './crypto.js';
 import type { Store } from './store.js';
 
 
 export async function useSupabaseAuthState(
   store: Store,
   userId: string,
-  /** Encryption key for the stored values. Only tests leave it out. */
-  key?: Buffer,
+  /**
+   * Keys for the stored values: the first writes, the rest only read, which is
+   * what makes a key rotation invisible to customers. Only tests leave it out.
+   */
+  ring?: KeyRing,
 ): Promise<{ state: AuthenticationState; saveCreds: () => Promise<void> }> {
   const toJson = (value: unknown): unknown => {
     const plain = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
-    return key ? seal(key, plain) : plain;
+    // Always the current key, so a row stops being on the old one the moment
+    // Baileys next writes it — which is how a rotation finishes on its own.
+    return ring ? seal(ring.current, plain) : plain;
   };
   const fromJson = (value: unknown): unknown => {
     if (isSealed(value)) {
-      if (!key) throw new Error('wa_auth is encrypted but no key is configured');
-      value = open(key, value);
+      if (!ring) throw new Error('wa_auth is encrypted but no key is configured');
+      value = openWithRing(ring, value);
     }
     return JSON.parse(JSON.stringify(value), BufferJSON.reviver);
   };

@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DisconnectReason } from 'baileys';
 import { useSupabaseAuthState } from '../src/authState.js';
-import { open, parseKey, seal } from '../src/crypto.js';
+import { keyRing, open, parseKey, seal } from '../src/crypto.js';
 import { createMailer } from '../src/email.js';
 import { ContactSaver } from '../src/saver.js';
 import { SessionManager } from '../src/sessions.js';
 import { PolicyCache } from '../src/store.js';
-import { FakeSocket, MemoryStore, msg, tick, USER } from './helpers.js';
+import { FakeSocket, MemoryStore, msg, queueOne, queuePending, tick, USER } from './helpers.js';
 
 const KEY = parseKey('ab'.repeat(32));
 
@@ -32,7 +32,7 @@ test('encryption: round trip, wrong key and tampering are rejected, bad keys ref
 
 test('wa_auth holds only ciphertext, and a restarted worker with the key reads it back', async () => {
   const store = new MemoryStore();
-  const first = await useSupabaseAuthState(store, USER, KEY);
+  const first = await useSupabaseAuthState(store, USER, keyRing(KEY));
   first.state.creds.me = { id: '15550009999:3@s.whatsapp.net' };
   await first.saveCreds();
   await first.state.keys.set({ 'pre-key': { '1': { public: Buffer.from('pub'), private: Buffer.from('priv') } } });
@@ -42,12 +42,12 @@ test('wa_auth holds only ciphertext, and a restarted worker with the key reads i
   }
   assert.equal(JSON.stringify([...store.auth.get(USER)!]).includes('15550009999'), false);
 
-  const second = await useSupabaseAuthState(store, USER, KEY);
+  const second = await useSupabaseAuthState(store, USER, keyRing(KEY));
   assert.deepEqual(second.state.creds.me, { id: '15550009999:3@s.whatsapp.net' });
   assert.deepEqual(second.state.creds.noiseKey, first.state.creds.noiseKey);
   assert.equal((await second.state.keys.get('pre-key', ['1']))['1']?.private.toString(), 'priv');
 
-  await assert.rejects(useSupabaseAuthState(store, USER, parseKey('cd'.repeat(32))));
+  await assert.rejects(useSupabaseAuthState(store, USER, keyRing(parseKey('cd'.repeat(32)))));
   await assert.rejects(useSupabaseAuthState(store, USER), /no key/);
 });
 
@@ -73,8 +73,8 @@ test('backfill: unsaved 1:1 chats found at linking wait as pending, then are sav
   ]);
   assert.equal(store.rows()[2]?.push_name, 'Late Name');
 
-  assert.equal(await saver.backfill(), 2);
-  assert.equal(await saver.backfill(), 0, 'pressing twice queues nothing extra');
+  assert.equal(await queuePending(store, saver), 2);
+  assert.equal(await queuePending(store, saver), 0, 'pressing twice queues nothing extra');
   await saver.idle();
   assert.deepEqual(
     sock.saved.map((s) => [s.jid, s.contact.fullName]),
@@ -84,7 +84,7 @@ test('backfill: unsaved 1:1 chats found at linking wait as pending, then are sav
     ],
   );
   assert.deepEqual(summary(store).map((r) => r[1]), ['saved', 'existing', 'saved']);
-  assert.equal(await saver.backfill(), 0);
+  assert.equal(await queuePending(store, saver), 0);
 });
 
 test('backfill candidates: a message saves one now, a hand-saved one becomes existing, a restart keeps the rest', async () => {
@@ -102,7 +102,7 @@ test('backfill candidates: a message saves one now, a hand-saved one becomes exi
 
   const restarted = new ContactSaver(USER, store, new PolicyCache(store, 0), () => sock, { sleep: async () => {} });
   await restarted.load();
-  assert.equal(await restarted.backfill(), 1);
+  assert.equal(await queuePending(store, restarted), 1);
   await restarted.idle();
   assert.deepEqual(sock.saved.map((s) => s.contact.fullName), ['Messaged Me', 'WA 0003']);
 });
@@ -112,7 +112,7 @@ test('backfill respects the daily cap and leaves the rest pending for another da
   store.settings.get(USER)!.daily_cap = 1;
   await saver.load();
   await saver.onHistory([1, 2, 3].map((n) => ({ id: `1555123000${n}@s.whatsapp.net` })));
-  await saver.backfill();
+  await queuePending(store, saver);
   await saver.idle();
   assert.equal(sock.saved.length, 1);
   assert.deepEqual(summary(store).map((r) => r[1]), ['saved', 'pending', 'pending']);
@@ -126,12 +126,15 @@ test('retry: a failed contact is tried again on request and its row is updated',
   await saver.idle();
   assert.deepEqual(summary(store), [['15551230001', 'failed', 'Unlucky']]);
 
-  assert.equal(await saver.retry('15559999999'), false, 'unknown number');
-  assert.equal(await saver.retry('15551230001'), true);
+  // The eligibility guards live in the store now: the dashboard can only ask
+  // for a row that exists and is waiting, and the endpoint turns "nothing was
+  // flagged" into a 404.
+  assert.equal(await store.requestQueue(USER, ['15559999999']), 0, 'unknown number');
+  assert.equal(await queueOne(store, saver, '15551230001'), 1);
   await saver.idle();
   assert.deepEqual(summary(store), [['15551230001', 'saved', 'Unlucky']]);
   assert.equal(store.rows()[0]?.error, null);
-  assert.equal(await saver.retry('15551230001'), false, 'a saved contact is not retried');
+  assert.equal(await store.requestQueue(USER, ['15551230001']), 0, 'a saved contact is not retried');
   assert.equal(sock.saved.length, 1);
 });
 
@@ -152,7 +155,7 @@ test('the disconnect email goes out once when WhatsApp logs the user out', async
     new PolicyCache(store, 0),
     (auth) => (sockets.push(new FakeSocket(auth.creds)), sockets.at(-1)!),
     undefined,
-    { authKey: KEY, onLoggedOut: (id) => void loggedOut.push(id) },
+    { authRing: keyRing(KEY), onLoggedOut: (id) => void loggedOut.push(id) },
   );
   await manager.start(USER, '15550009999');
   assert.equal(manager.connectedSaver(USER), undefined, 'not connected yet');

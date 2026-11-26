@@ -8,20 +8,28 @@ import type { AuthedUser, TokenVerifier } from './auth.js';
 import { HttpError } from './billing.js';
 import type { Billing } from './billing.js';
 import { errorMessage, log } from './log.js';
+import { maySave } from './store.js';
 import type { Store } from './store.js';
 
 export interface AppDeps {
   webUrl: string;
+  /** Lower-cased emails allowed to see the admin page. Empty means nobody. */
+  adminEmails?: string[];
   verifyToken: TokenVerifier;
   /** Verifies the signature and parses the event; throws if it is not from Stripe. */
   constructEvent: (rawBody: Buffer, signature: string) => Stripe.Event;
   store: Store;
   billing: Pick<Billing, 'checkoutUrl' | 'portalUrl' | 'cancelAll' | 'handleEvent'>;
+  /**
+   * Only what the HTTP layer still needs from the worker: a socket count for
+   * /health and the admin page, and a nudge so a reconcile happens in seconds
+   * rather than at the next tick. It no longer opens or closes sockets — those
+   * are intent rows now, so a request landing on a replica that does not own
+   * the user is harmless.
+   */
   sessions: {
     count(): number;
-    start(userId: string, pairPhone?: string): Promise<void>;
-    logout(userId: string): Promise<void>;
-    connectedSaver(userId: string): { backfill(): Promise<number>; retry(phone: string): Promise<boolean> } | undefined;
+    nudge?(): void;
   };
 }
 
@@ -57,6 +65,11 @@ export function createApp(deps: AppDeps): express.Express {
 
   app.use(express.json({ limit: '100kb' }));
 
+  const admins = new Set((deps.adminEmails ?? []).map((email) => email.trim().toLowerCase()));
+  // Fails closed: with no ADMIN_EMAILS configured, nobody is an admin.
+  const isAdmin = (user: AuthedUser): boolean =>
+    Boolean(user.email) && admins.has(user.email!.trim().toLowerCase());
+
   const authed = (handler: Handler) => async (req: Request, res: Response, next: NextFunction) => {
     const token = /^Bearer (.+)$/i.exec(req.headers.authorization ?? '')?.[1];
     let user: AuthedUser;
@@ -77,9 +90,14 @@ export function createApp(deps: AppDeps): express.Express {
   app.post(
     '/api/session/start',
     authed(async (req, res, user) => {
-      if (!(await deps.store.getPolicy(user.id)).subscribed) {
-        throw new HttpError(402, 'Subscribe to connect WhatsApp');
-      }
+      // No subscription needed to link. An unsubscribed account runs as a
+      // preview: the worker records who it would have saved and writes
+      // nothing, which is a far better demonstration than any screenshot
+      // because it is the customer's own chats. decide() is what enforces
+      // that, so setting `armed` without paying achieves nothing.
+      //
+      // The cost of this is real — a free account holds a WhatsApp socket —
+      // and FREE_WATCH_DAYS is the lever that bounds it.
       // The user's own number, with country code: "+1 (555) 123-4567" -> "15551234567".
       const raw = (req.body as { phone?: unknown } | undefined)?.phone;
       const phone = typeof raw === 'string' ? raw.replace(/\D/g, '').replace(/^00/, '') : '';
@@ -88,7 +106,16 @@ export function createApp(deps: AppDeps): express.Express {
       if (!valid && !(await deps.store.hasAuth(user.id))) {
         throw new HttpError(400, 'Enter your WhatsApp number with the country code, for example +1 555 123 4567');
       }
-      await deps.sessions.start(user.id, valid ? phone : undefined);
+      // Write what they want and return. The replica that owns this customer
+      // picks it up on its next tick and asks WhatsApp for a code; the
+      // dashboard is already polling for it. Nothing in this request waits on
+      // WhatsApp, so a slow WhatsApp is our spinner rather than a timeout.
+      await deps.store.updateSession(user.id, {
+        desired: 'on',
+        logout_requested_at: null,
+        ...(valid ? { pair_phone: phone, status: 'connecting', pairing_code: null } : {}),
+      });
+      deps.sessions.nudge?.();
       res.json({ ok: true });
     }),
   );
@@ -96,31 +123,88 @@ export function createApp(deps: AppDeps): express.Express {
   app.post(
     '/api/session/logout',
     authed(async (_req, res, user) => {
-      await deps.sessions.logout(user.id);
+      await deps.store.updateSession(user.id, {
+        desired: 'off',
+        pair_phone: null,
+        logout_requested_at: new Date().toISOString(),
+      });
+      deps.sessions.nudge?.();
       res.json({ ok: true });
     }),
   );
 
-  // Save the people from existing chats that were found when WhatsApp was linked.
+  // Save the people from existing chats found when WhatsApp was linked, plus
+  // anyone the daily cap held back.
+  // Refused unless the owning worker reports the session connected. Without
+  // this the request would flag the rows, the worker would find no socket and
+  // clear them, and the button would say "queued 5" while nothing happened.
+  // Read from the database rather than a socket, so any replica can answer.
+  const requireConnected = async (userId: string) => {
+    if ((await deps.store.getSessionStatus(userId)) !== 'connected') {
+      throw new HttpError(409, 'Connect WhatsApp first');
+    }
+  };
+
   app.post(
     '/api/contacts/backfill',
     authed(async (_req, res, user) => {
-      const saver = deps.sessions.connectedSaver(user.id);
-      if (!saver) throw new HttpError(409, 'Connect WhatsApp first');
-      res.json({ queued: await saver.backfill() });
+      await requireConnected(user.id);
+      const queued = await deps.store.requestQueue(user.id, 'all-pending');
+      deps.sessions.nudge?.();
+      res.json({ queued });
     }),
   );
 
-  // Try one failed contact again.
+  // Try one contact again. The same request as a backfill, for one person.
   app.post(
     '/api/contacts/retry',
     authed(async (req, res, user) => {
       const phone = (req.body as { phone?: unknown } | undefined)?.phone;
       if (typeof phone !== 'string' || !/^\d{5,20}$/.test(phone)) throw new HttpError(400, 'Unknown contact');
-      const saver = deps.sessions.connectedSaver(user.id);
-      if (!saver) throw new HttpError(409, 'Connect WhatsApp first');
-      if (!(await saver.retry(phone))) throw new HttpError(404, 'Nothing to retry for that contact');
+      await requireConnected(user.id);
+      const queued = await deps.store.requestQueue(user.id, [phone]);
+      if (queued === 0) throw new HttpError(404, 'Nothing to retry for that contact');
+      deps.sessions.nudge?.();
       res.json({ ok: true });
+    }),
+  );
+
+  /**
+   * Is the signed-in user an operator?
+   *
+   * Answers 200 with a boolean rather than 403, because the dashboard calls it
+   * on every page load just to decide whether to show a nav link, and a 403 on
+   * an ordinary customer's normal navigation is noise in the logs that looks
+   * like an attack. The real refusal is on the overview below.
+   */
+  app.post(
+    '/api/admin/check',
+    authed(async (_req, res, user) => {
+      res.json({ admin: isAdmin(user) });
+    }),
+  );
+
+  app.post(
+    '/api/admin/overview',
+    authed(async (req, res, user) => {
+      // Checked against the email in the verified Supabase JWT, so this is not
+      // something a client can assert about itself.
+      if (!isAdmin(user)) throw new HttpError(403, 'Not an admin');
+      const raw = (req.body as { limit?: unknown } | undefined)?.limit;
+      const limit = Math.min(Math.max(Number(raw) || 200, 1), 1000);
+      const customers = await deps.store.adminOverview(limit);
+      res.json({
+        customers,
+        totals: {
+          customers: customers.length,
+          subscribed: customers.filter((c) => maySave(c.subscription_status, c.grace_until)).length,
+          connected: customers.filter((c) => c.session_status === 'connected').length,
+          armed: customers.filter((c) => c.armed === true).length,
+          saved: customers.reduce((sum, c) => sum + c.saved_count, 0),
+          failed: customers.reduce((sum, c) => sum + c.failed_count, 0),
+        },
+        sockets: deps.sessions.count(),
+      });
     }),
   );
 
@@ -141,7 +225,14 @@ export function createApp(deps: AppDeps): express.Express {
   app.post(
     '/api/account/delete',
     authed(async (_req, res, user) => {
-      await deps.sessions.logout(user.id);
+      // Ask for the device to be unlinked before the rows go. The reconcile
+      // may not have run yet when the cascade removes the session row, so the
+      // credentials are deleted here too rather than relied upon.
+      await deps.store.updateSession(user.id, {
+        desired: 'off',
+        logout_requested_at: new Date().toISOString(),
+      });
+      deps.sessions.nudge?.();
       await deps.billing.cancelAll(user.id);
       await deps.store.deleteUser(user.id); // cascades to every table
       res.json({ ok: true });
