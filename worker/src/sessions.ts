@@ -64,7 +64,12 @@ let waVersion: WAVersion | undefined;
 export const baileysSocketFactory: SocketFactory = async (auth) => {
   waVersion ??= await fetchLatestBaileysVersion()
     .then((r) => r.version)
-    .catch(() => undefined);
+    .catch((error) => {
+      // Falls back to the version bundled with Baileys, which WhatsApp starts
+      // refusing once it is old enough. Worth seeing in the logs when linking fails.
+      log.warn('could not fetch the current WhatsApp version, using the bundled one', { error: errorMessage(error) });
+      return undefined;
+    });
   return makeWASocket({
     auth: {
       creds: auth.creds,
@@ -404,6 +409,9 @@ export class SessionManager {
       await this.store.updateSession(userId, {
         status: 'connected',
         pairing_code: null,
+        // Linked: the number has done its job. Left behind, it would make every
+        // later reconcile look like a request to pair again.
+        pair_phone: null,
         phone,
         last_connected_at: new Date().toISOString(),
       });
@@ -431,11 +439,36 @@ export class SessionManager {
 
     const paired = Boolean(sock.authState.creds.me);
     if (!paired && code !== DisconnectReason.restartRequired) {
-      // Nobody entered the code before WhatsApp gave up. Stop quietly; the user
-      // presses Connect again when they are ready.
+      // Nobody entered the code before WhatsApp gave up, or WhatsApp refused
+      // the link. Stop, and stop *wanting* it: with desired left 'on' the
+      // reconcile loop would open a new socket seconds later and replace the
+      // code on screen while the person was still typing the old one. They
+      // press Connect again when they are ready.
+      log.warn('pairing ended without linking', { userId, code });
       this.#drop(userId, live);
       await this.store.deleteAuth(userId);
-      await this.store.updateSession(userId, { status: 'disconnected', pairing_code: null });
+      await this.store.updateSession(userId, {
+        status: 'disconnected',
+        pairing_code: null,
+        desired: 'off',
+        pair_phone: null,
+      });
+      return;
+    }
+
+    if (code === DisconnectReason.restartRequired) {
+      // Expected right after a code is entered: WhatsApp drops the pairing
+      // connection and wants a fresh one with the new login. Do it at once —
+      // no backoff, and it is not a failure.
+      log.info('WhatsApp linked, restarting connection', { userId });
+      await this.store.updateSession(userId, { status: 'connecting', pairing_code: null });
+      live.timer = this.setTimer(() => {
+        if (this.#live.get(userId) !== live || live.closing) return;
+        void this.#open(userId, live).catch((error) => {
+          log.error('reconnect failed', { userId, error: errorMessage(error) });
+          if (this.#live.get(userId) === live && !live.closing) this.#scheduleReconnect(userId, live);
+        });
+      }, 0);
       return;
     }
 
@@ -451,11 +484,11 @@ export class SessionManager {
     live.timer = this.setTimer(() => {
       void (async () => {
         if (this.#live.get(userId) !== live || live.closing) return;
-        this.policy.invalidate(userId);
-        if (!(await this.policy.get(userId)).subscribed) {
-          await this.stop(userId);
-          return;
-        }
+        // No subscription check here. An unsubscribed account is previewing
+        // and needs its socket like anyone else; it used to be stopped on the
+        // very restart WhatsApp asks for after pairing, so a free account
+        // could never finish linking. Whether a socket should exist at all is
+        // `desired`, which the reconcile loop enforces.
         await this.#open(userId, live);
       })().catch((error) => {
         log.error('reconnect failed', { userId, error: errorMessage(error) });

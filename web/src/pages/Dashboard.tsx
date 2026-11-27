@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Card, inputClass, Notice, Switch } from '../components/ui';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
@@ -52,6 +51,22 @@ export function Dashboard() {
   const [contacts, setContacts] = useState<SavedContact[]>([]);
   const [search, setSearch] = useState('');
   const [phone, setPhone] = useState('');
+  // Remember that a code was on screen, so a drop back to "disconnected" can
+  // say the code expired instead of looking like nothing happened.
+  const hadCode = useRef(false);
+  const [codeExpired, setCodeExpired] = useState(false);
+  useEffect(() => {
+    if (session?.status === 'pairing' && session.pairing_code) {
+      hadCode.current = true;
+      setCodeExpired(false);
+    } else if (session?.status === 'disconnected' && hadCode.current) {
+      hadCode.current = false;
+      setCodeExpired(true);
+    } else if (session?.status === 'connected') {
+      hadCode.current = false;
+      setCodeExpired(false);
+    }
+  }, [session?.status, session?.pairing_code]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -211,6 +226,10 @@ export function Dashboard() {
               <li>Tap Link a device, then “Link with phone number instead”.</li>
               <li>Type the code above. It stops working after a few minutes.</li>
             </ol>
+            <p className="max-w-sm text-xs text-slate-500">
+              WhatsApp says the code is wrong? Check the number above is yours, press Cancel, and connect again for a
+              fresh code.
+            </p>
           </div>
         )}
         {status === 'connected' && (
@@ -224,12 +243,17 @@ export function Dashboard() {
             This device was removed from your WhatsApp linked devices. Connect again to keep saving contacts.
           </p>
         )}
+        {status === 'disconnected' && codeExpired && (
+          <Notice>That code expired before it was entered. Press Connect for a new one.</Notice>
+        )}
         {status === 'disconnected' && (
           <p className="mb-4 text-sm text-slate-600">
-            {subscribed ? 'Connect your WhatsApp to start saving contacts.' : 'Subscribe first, then connect your WhatsApp.'}
+            {subscribed
+              ? 'Connect your WhatsApp to start saving contacts.'
+              : 'Connect your WhatsApp to try it free: you will see who would be saved, without saving anyone.'}
           </p>
         )}
-        {!live && subscribed && (
+        {!live && (
           <form
             className="flex flex-col gap-2 sm:flex-row sm:items-end"
             onSubmit={(e) => {
@@ -239,6 +263,10 @@ export function Dashboard() {
           >
             <label className="block grow">
               <span className="mb-1 block text-sm font-medium">Your WhatsApp number, with country code</span>
+              <span className="mb-1 block text-xs text-slate-500">
+                Start with + and the country code, and leave out the 0 your local number may begin with: +44 7700
+                900123, not +44 07700 900123.
+              </span>
               <input
                 className={inputClass}
                 type="tel"
@@ -256,19 +284,16 @@ export function Dashboard() {
           </form>
         )}
         <div className="flex flex-wrap gap-2">
-          {!live && !subscribed && (
-            <>
-              <Button disabled>Connect</Button>
-              <Link
-                to="/billing"
-                className="inline-flex min-h-11 items-center rounded-lg px-3 text-sm font-medium text-accent-dark underline"
-              >
-                Subscribe to connect
-              </Link>
-            </>
-          )}
+
           {live && (
-            <Button variant="secondary" disabled={busy} onClick={() => void run('/api/session/logout')}>
+            <Button
+              variant="secondary"
+              disabled={busy}
+              onClick={() => {
+                hadCode.current = false;
+                void run('/api/session/logout');
+              }}
+            >
               {status === 'connected' ? 'Disconnect' : 'Cancel'}
             </Button>
           )}
