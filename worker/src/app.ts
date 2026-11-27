@@ -48,6 +48,12 @@ export interface AppDeps {
 
 type Handler = (req: Request, res: Response, user: AuthedUser) => Promise<void>;
 
+/** A CSV field. A leading = + - @ would run as a formula in a spreadsheet, and names come from strangers. */
+export function csvCell(value: string): string {
+  const safe = /^[=+\-@\t\r]/.test(value) && !/^\+\d+$/.test(value) ? `'${value}` : value;
+  return `"${safe.replaceAll('"', '""')}"`;
+}
+
 export function createApp(deps: AppDeps): express.Express {
   const app = express();
   app.disable('x-powered-by');
@@ -225,6 +231,33 @@ export function createApp(deps: AppDeps): express.Express {
         },
         sockets: deps.sessions.count(),
       });
+    }),
+  );
+
+  /**
+   * Every contact saved for every customer, as a CSV download.
+   *
+   * There is no second copy of the data to keep in sync: saved_contacts is
+   * already the record, and this reads across all customers with the service
+   * role. Opted-out people are included with status "removed", so the file
+   * says who must not be contacted rather than silently dropping them.
+   */
+  app.post(
+    '/api/admin/contacts.csv',
+    authed(async (_req, res, user) => {
+      if (!isAdmin(user)) throw new HttpError(403, 'Not an admin');
+      const rows = await deps.store.adminContacts();
+      const lines = [
+        ['customer', 'name', 'phone', 'status', 'saved_at'].join(','),
+        ...rows.map((r) =>
+          [r.owner_email ?? '', r.name ?? '', r.phone ? `+${r.phone}` : '', r.status, r.created_at].map(csvCell).join(','),
+        ),
+      ];
+      log.info('admin exported all contacts', { by: user.id, rows: rows.length });
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="all-contacts.csv"');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(lines.join('\r\n'));
     }),
   );
 

@@ -299,6 +299,10 @@ in Postgres runs with its owner's rights by default, which would have been a way
 straight past every policy in `0002`. `supabase/tests/rls.sql` checks a customer
 is refused and the worker is not.
 
+### Downloading every contact
+
+**Download all contacts** on the admin page gives one CSV of every contact saved for every customer: customer email, name, number, status and when it was saved. It reads `saved_contacts` directly, so there is no second copy to keep in sync. Opted-out people stay in the file with status `removed`. Contacts that were never saved (`pending`) are left out. The file holds other people's phone numbers, so keep it private and delete copies you no longer need.
+
 ### Giving someone Pro
 
 Each customer row has a **Give Pro** / **Remove Pro** button. Pro given this way works without Stripe and is stored separately from the Stripe subscription, so no webhook can undo it. It takes effect within about 15 seconds; giving Pro also reconnects a socket an expired free preview had closed. Removing it drops the customer to the free preview.

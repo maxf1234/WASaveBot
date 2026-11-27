@@ -125,6 +125,15 @@ export interface RuleRow {
   created_at: string;
 }
 
+/** One contact from any customer, for the admin export. */
+export interface AdminContactRow {
+  owner_email: string | null;
+  phone: string;
+  name: string | null;
+  status: ContactStatus;
+  created_at: string;
+}
+
 /** One customer, as the admin page shows them. */
 export interface AdminRow {
   user_id: string;
@@ -211,6 +220,8 @@ export interface Store {
   purgeEvents(retentionDays: number): Promise<number>;
   /** One row per customer, for the operator's admin page. */
   adminOverview(limit: number): Promise<AdminRow[]>;
+  /** Every customer's contacts, oldest first, for the admin export. */
+  adminContacts(): Promise<AdminContactRow[]>;
   /** Grant or take away admin-given Pro. False if there is no such customer. */
   setProGranted(userId: string, granted: boolean): Promise<boolean>;
   deleteUser(userId: string): Promise<void>;
@@ -574,6 +585,36 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
           .limit(limit),
         'read admin overview',
       ) ?? []) as AdminRow[];
+    },
+
+    async adminContacts() {
+      const out: AdminContactRow[] = [];
+      for (let from = 0; ; from += 1000) {
+        const rows = check(
+          await db
+            .from('saved_contacts')
+            .select('id, phone, saved_name, requested_name, push_name, status, created_at, profiles(email)')
+            // Pending rows were never saved: people found in old chats or held
+            // by the daily cap. They are not part of "contacts saved".
+            .neq('status', 'pending')
+            .order('id', { ascending: true })
+            .range(from, from + 999),
+          'read all contacts',
+        );
+        for (const r of rows ?? []) {
+          const owner = r.profiles as { email?: string | null } | { email?: string | null }[] | null;
+          out.push({
+            owner_email: (Array.isArray(owner) ? owner[0]?.email : owner?.email) ?? null,
+            // An unresolved row's "phone" is a WhatsApp internal id, not a number.
+            phone: r.status === 'unresolved' ? '' : (r.phone as string),
+            name: ((r.saved_name ?? r.requested_name ?? r.push_name) as string | null) ?? null,
+            status: r.status as ContactStatus,
+            created_at: r.created_at as string,
+          });
+        }
+        if ((rows?.length ?? 0) < 1000) break;
+      }
+      return out;
     },
 
     async setProGranted(userId, granted) {
