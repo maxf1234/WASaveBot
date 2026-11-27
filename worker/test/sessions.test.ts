@@ -161,13 +161,40 @@ test('any other close reconnects with backoff 2s, 5s, 15s, 60s, 60s', async () =
   assert.equal(timers[5]!.ms, 2000);
 });
 
-test('the restart WhatsApp asks for right after pairing reconnects', async () => {
-  const { sockets, timers, manager, close } = setup();
-  await manager.start(USER);
-  sockets[0]!.authState.creds.me = undefined;
+test('the restart WhatsApp asks for right after pairing reconnects at once', async () => {
+  const { store, sockets, timers, manager, close } = setup();
+  await manager.start(USER, '15550009999');
+  sockets[0]!.ev.emit('connection.update', { qr: 'QR-1' });
+  await tick();
+  sockets[0]!.authState.creds.me = { id: '15550009999:1@s.whatsapp.net' };
   close(sockets[0]!, DisconnectReason.restartRequired);
   await tick();
   assert.equal(timers.length, 1);
+  assert.equal(timers[0]!.ms, 0, 'no backoff for the expected restart');
+  timers[0]!.fn();
+  await tick();
+  assert.equal(sockets.length, 2, 'a fresh socket with the new login');
+  sockets[1]!.ev.emit('connection.update', { connection: 'open' });
+  await tick();
+  assert.equal(store.sessions.get(USER)?.status, 'connected');
+  assert.equal(store.sessions.get(USER)?.pair_phone, null, 'the number is cleared once linked');
+});
+
+test('an unsubscribed account previewing still finishes linking', async () => {
+  // It used to be stopped on the post-pairing restart, so a free account
+  // could never link.
+  const { store, sockets, timers, manager, close } = setup();
+  store.profiles.get(USER)!.subscription_status = 'none';
+  await manager.start(USER, '15550009999');
+  sockets[0]!.ev.emit('connection.update', { qr: 'QR-1' });
+  await tick();
+  sockets[0]!.authState.creds.me = { id: 'paired' };
+  close(sockets[0]!, DisconnectReason.restartRequired);
+  await tick();
+  timers[0]!.fn();
+  await tick();
+  assert.equal(sockets.length, 2);
+  assert.equal(manager.has(USER), true);
 });
 
 test('a code nobody enters times out and stops quietly instead of looping', async () => {
@@ -180,6 +207,10 @@ test('a code nobody enters times out and stops quietly instead of looping', asyn
   assert.equal(timers.length, 0);
   assert.deepEqual([store.sessions.get(USER)?.status, store.sessions.get(USER)?.pairing_code], ['disconnected', null]);
   assert.equal(manager.has(USER), false);
+  // And it is no longer wanted, so the reconcile loop does not swap in a new
+  // code behind the person's back.
+  assert.equal(store.sessions.get(USER)?.desired, 'off');
+  assert.equal(store.sessions.get(USER)?.pair_phone, null);
 });
 
 test('pressing Connect again with a corrected number starts a fresh pairing', async () => {
