@@ -381,6 +381,18 @@ test('an admin can download every customer\'s contacts as CSV', async () => {
   assert.ok(lines.some((l) => l.includes('"Opted Out","+15550000004","removed"')), 'opt-outs are kept and marked');
 });
 
+test('contacts saved by admin accounts are left out of the export', async () => {
+  const { post, store } = setup(7, ['boss@example.com']);
+  store.addUser('boss', 'active');
+  store.profiles.get('boss')!.email = 'Boss@Example.com';
+  await store.claimContact('boss', { phone: '15550000009', status: 'saved', saved_name: 'Admin Friend' });
+  await store.claimContact(USER, { phone: '15550000001', status: 'saved', saved_name: 'Ana' });
+
+  const text = await (await post('/api/admin/contacts.csv', 'good:boss')).text();
+  assert.doesNotMatch(text, /Admin Friend|15550000009/);
+  assert.match(text, /Ana/);
+});
+
 test('the admin email match ignores case and surrounding space', async () => {
   const { post } = setup(7, ['  BOSS@Example.com ']);
   assert.deepEqual(await (await post('/api/admin/check', 'good:boss')).json(), { admin: true });

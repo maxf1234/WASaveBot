@@ -235,7 +235,8 @@ export function createApp(deps: AppDeps): express.Express {
   );
 
   /**
-   * Every contact saved for every customer, as a CSV download.
+   * Every contact saved for every customer, as a CSV download. Contacts
+   * saved by admin accounts are excluded.
    *
    * There is no second copy of the data to keep in sync: saved_contacts is
    * already the record, and this reads across all customers with the service
@@ -246,7 +247,11 @@ export function createApp(deps: AppDeps): express.Express {
     '/api/admin/contacts.csv',
     authed(async (_req, res, user) => {
       if (!isAdmin(user)) throw new HttpError(403, 'Not an admin');
-      const rows = await deps.store.adminContacts();
+      // Admins' own accounts are left out: those are the operator testing
+      // the product, not customers, and their contacts do not belong in it.
+      const rows = (await deps.store.adminContacts()).filter(
+        (r) => !r.owner_email || !admins.has(r.owner_email.trim().toLowerCase()),
+      );
       const lines = [
         ['customer', 'name', 'phone', 'status', 'saved_at'].join(','),
         ...rows.map((r) =>
