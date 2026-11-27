@@ -357,6 +357,30 @@ test('only an admin can change Pro, and bad requests are refused', async () => {
   assert.equal((await post('/api/admin/pro', 'good:boss', { userId: 'nobody', pro: true })).status, 404);
 });
 
+test('an admin can download every customer\'s contacts as CSV', async () => {
+  const { post, store } = setup(7, ['boss@example.com']);
+  store.addUser('boss', 'active');
+  store.profiles.get('boss')!.email = 'boss@example.com';
+  await store.claimContact(USER, { phone: '15550000001', status: 'saved', saved_name: 'Ana' });
+  await store.claimContact('other', { phone: '15550000002', status: 'saved', saved_name: '=HYPERLINK("x")' });
+  await store.claimContact('other', { phone: '15550000003', status: 'pending' });
+  await store.claimContact('other', { phone: '15550000004', status: 'removed', saved_name: 'Opted Out' });
+
+  assert.equal((await post('/api/admin/contacts.csv', `good:${USER}`)).status, 403, 'customers cannot');
+
+  const res = await post('/api/admin/contacts.csv', 'good:boss');
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') ?? '', /text\/csv/);
+  assert.match(res.headers.get('content-disposition') ?? '', /attachment/);
+  const text = await res.text();
+  const lines = text.split('\r\n');
+  assert.equal(lines[0], 'customer,name,phone,status,saved_at');
+  assert.equal(lines.length, 4, 'pending rows were never saved, so they are left out');
+  assert.ok(lines.some((l) => l.startsWith(`"${USER}@example.com","Ana","+15550000001","saved"`)), text);
+  assert.ok(lines.some((l) => l.includes(`"'=HYPERLINK(""x"")"`)), 'a formula in a name is defused');
+  assert.ok(lines.some((l) => l.includes('"Opted Out","+15550000004","removed"')), 'opt-outs are kept and marked');
+});
+
 test('the admin email match ignores case and surrounding space', async () => {
   const { post } = setup(7, ['  BOSS@Example.com ']);
   assert.deepEqual(await (await post('/api/admin/check', 'good:boss')).json(), { admin: true });

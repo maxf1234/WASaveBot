@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Button, Card, Notice } from '../components/ui';
-import { api } from '../lib/api';
+import { api, download } from '../lib/api';
 
 /**
  * The operator's view: every customer, their session, and what the product has
@@ -98,6 +98,19 @@ export function Admin() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [changing, setChanging] = useState('');
+  const [exporting, setExporting] = useState(false);
+
+  const exportAll = async () => {
+    setExporting(true);
+    try {
+      await download('/api/admin/contacts.csv', `all-contacts-${new Date().toISOString().slice(0, 10)}.csv`);
+      setError('');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const setPro = async (c: Customer, pro: boolean) => {
     if (!pro && !window.confirm(`Take Pro away from ${c.email ?? c.user_id}? They drop to the free preview.`)) return;
@@ -145,7 +158,19 @@ export function Admin() {
   return (
     <div className="space-y-4">
       {error && <Notice kind="error">{error}</Notice>}
-      <Card title="Everyone" action={<Button variant="secondary" onClick={() => void load()}>Refresh</Button>}>
+      <Card
+        title="Everyone"
+        action={
+          <div className="flex gap-2">
+            <Button variant="secondary" disabled={exporting} onClick={() => void exportAll()}>
+              {exporting ? 'Preparing…' : 'Download all contacts'}
+            </Button>
+            <Button variant="secondary" onClick={() => void load()}>
+              Refresh
+            </Button>
+          </div>
+        }
+      >
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           {[
             ['Customers', totals.customers],

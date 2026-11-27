@@ -232,6 +232,19 @@ export class MemoryStore implements Store {
     }
     return removed;
   }
+  async adminContacts() {
+    return [...this.profiles.values()].flatMap((p) =>
+      this.rows(p.id)
+        .filter((r) => r.status !== 'pending')
+        .map((r) => ({
+          owner_email: p.email,
+          phone: r.status === 'unresolved' ? '' : r.phone,
+          name: r.saved_name ?? r.requested_name ?? r.push_name ?? null,
+          status: r.status,
+          created_at: new Date().toISOString(),
+        })),
+    );
+  }
   async setProGranted(userId: string, granted: boolean) {
     const profile = this.profiles.get(userId);
     if (!profile) return false;
