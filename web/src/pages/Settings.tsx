@@ -61,6 +61,7 @@ export function Settings() {
         name_template: form.name_template.trim(),
         fallback_prefix: prefix,
         save_to_phone: form.save_to_phone,
+        save_groups: form.save_groups,
         daily_cap: form.daily_cap,
         save_mode: form.save_mode,
         save_phrase: savePhrase,
@@ -256,6 +257,22 @@ export function Settings() {
               label="Also save to my phone's address book"
               checked={form.save_to_phone}
               onChange={(next) => set('save_to_phone', next)}
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="text-sm font-medium">Also save everyone in my groups</div>
+              <div className="text-sm text-slate-500">
+                Saves the members of every WhatsApp group you are in, up to your daily cap each day, so a big group fills
+                in over a few days. Your rules and opt-outs still apply. Members whose number WhatsApp hides are listed
+                but cannot be saved.
+              </div>
+            </div>
+            <Switch
+              label="Also save everyone in my groups"
+              checked={form.save_groups ?? false}
+              onChange={(next) => set('save_groups', next)}
             />
           </div>
 

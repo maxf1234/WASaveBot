@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import type { ManagedSocket } from '../src/sessions.js';
 import type {
-  ContactRow, Policy, Profile, RuleRow, SaveEvent, SessionPatch, SessionStatus, Settings, Store,
+  ContactRow, GroupMemberRow, Policy, Profile, RuleRow, SaveEvent, SessionPatch, SessionStatus, Settings, Store,
 } from '../src/store.js';
 import { maySave } from '../src/store.js';
 import type { PrefixRule, RuleKind } from '../src/rules.js';
@@ -21,6 +21,7 @@ export const defaultSettings = (): Settings => ({
   save_phrase: 'save my number',
   remove_phrase: 'remove my number',
   default_policy: 'allow',
+  save_groups: false,
 });
 
 /** An in-memory stand-in for Supabase. */
@@ -123,6 +124,8 @@ export class MemoryStore implements Store {
         pair_phone: row.pair_phone ?? null,
         logout_requested_at: row.logout_requested_at ?? null,
         status: (row.status ?? 'disconnected') as SessionStatus,
+        groups_requested_at: row.groups_requested_at ?? null,
+        groups_scanned_at: row.groups_scanned_at ?? null,
       }));
   }
   async queuedContacts() {
@@ -232,6 +235,10 @@ export class MemoryStore implements Store {
     }
     return removed;
   }
+  groupMembers = new Map<string, GroupMemberRow[]>();
+  async replaceGroupMembers(userId: string, rows: GroupMemberRow[]) {
+    this.groupMembers.set(userId, rows.map((r) => ({ ...r })));
+  }
   async adminContacts() {
     return [...this.profiles.values()].flatMap((p) =>
       this.rows(p.id)
@@ -336,6 +343,11 @@ export class FakeSocket implements ManagedSocket {
   }
   removed: string[] = [];
   failNextRemove = 0;
+  /** Groups the fake account is in, as Baileys returns them. Reading them sends nothing. */
+  groups: Record<string, { id: string; subject?: string; participants: { id: string; lid?: string; phoneNumber?: string; admin?: string | null; notify?: string }[] }> = {};
+  async groupFetchAllParticipating() {
+    return this.groups;
+  }
   async removeContact(jid: string) {
     if (this.failNextRemove > 0) {
       this.failNextRemove -= 1;
