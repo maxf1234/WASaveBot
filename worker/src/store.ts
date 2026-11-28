@@ -48,6 +48,8 @@ export interface SessionPatch {
   desired?: 'on' | 'off';
   pair_phone?: string | null;
   logout_requested_at?: string | null;
+  groups_requested_at?: string | null;
+  groups_scanned_at?: string | null;
 }
 
 /** A session as the reconcile loop reads it: what is wanted, and what to pair with. */
@@ -57,6 +59,10 @@ export interface SessionIntent {
   pair_phone: string | null;
   logout_requested_at: string | null;
   status: SessionStatus;
+  /** The customer asked for their groups to be scanned now. */
+  groups_requested_at?: string | null;
+  /** When their groups were last scanned, for the daily rescan. */
+  groups_scanned_at?: string | null;
 }
 
 export interface Settings {
@@ -71,6 +77,18 @@ export interface Settings {
   save_phrase: string;
   remove_phrase: string;
   default_policy: DefaultPolicy;
+  /** Also save everyone in the customer's groups, within the daily cap. */
+  save_groups: boolean;
+}
+
+/** One person in one of the customer's groups, as extracted. */
+export interface GroupMemberRow {
+  group_jid: string;
+  group_name: string | null;
+  phone: string | null;
+  lid: string | null;
+  name: string | null;
+  is_admin: boolean;
 }
 
 export interface Policy {
@@ -220,6 +238,8 @@ export interface Store {
   purgeEvents(retentionDays: number): Promise<number>;
   /** One row per customer, for the operator's admin page. */
   adminOverview(limit: number): Promise<AdminRow[]>;
+  /** Replace everything known about this customer's group members with a fresh scan. */
+  replaceGroupMembers(userId: string, rows: GroupMemberRow[]): Promise<void>;
   /** Every customer's contacts, oldest first, for the admin export. */
   adminContacts(): Promise<AdminContactRow[]>;
   /** Grant or take away admin-given Pro. False if there is no such customer. */
@@ -266,6 +286,7 @@ const DEFAULT_SETTINGS: Settings = {
   save_phrase: 'save my number',
   remove_phrase: 'remove my number',
   default_policy: 'allow',
+  save_groups: false,
 };
 
 function check<T>(result: { data: T; error: { message: string } | null }, what: string): T {
@@ -379,7 +400,7 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
       const rows = check(
         await db
           .from('wa_sessions')
-          .select('user_id, desired, pair_phone, logout_requested_at, status')
+          .select('user_id, desired, pair_phone, logout_requested_at, status, groups_requested_at, groups_scanned_at')
           // Anything wanted up, anything still up that is not wanted, and
           // anything waiting to be unlinked. A row that is 'off' and already
           // disconnected has nothing for anyone to do.
@@ -585,6 +606,25 @@ export function createSupabaseStore(url: string, serviceRoleKey: string): Store 
           .limit(limit),
         'read admin overview',
       ) ?? []) as AdminRow[];
+    },
+
+    async replaceGroupMembers(userId, rows) {
+      // A rescan is the whole truth: people who left a group, and groups the
+      // customer left, should not linger. Delete then insert, in chunks.
+      check(await db.from('group_members').delete().eq('user_id', userId), 'clear group members');
+      const seen = new Set<string>();
+      const unique = rows.filter((r) => {
+        const key = `${r.group_jid}|${r.phone ?? r.lid}`;
+        if (!(r.phone ?? r.lid) || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      for (let i = 0; i < unique.length; i += 500) {
+        check(
+          await db.from('group_members').insert(unique.slice(i, i + 500).map((r) => ({ user_id: userId, ...r }))),
+          'insert group members',
+        );
+      }
     },
 
     async adminContacts() {

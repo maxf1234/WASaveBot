@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { GroupsCard } from '../components/GroupsCard';
 import { Button, Card, inputClass, Notice, Switch } from '../components/ui';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
@@ -327,6 +328,8 @@ export function Dashboard() {
           </div>
         </Card>
       )}
+
+      <GroupsCard userId={userId} connected={status === 'connected'} />
 
       <div className="grid grid-cols-3 gap-3">
         {[

@@ -21,7 +21,7 @@ import { assertShard, describeShard, owns, SINGLE } from './shard.js';
 import type { Shard } from './shard.js';
 import { ContactSaver } from './saver.js';
 import type { IncomingContact, IncomingMessage, WaSocketLike } from './saver.js';
-import type { PolicyCache, Store } from './store.js';
+import type { PolicyCache, SessionIntent, Store } from './store.js';
 
 /** The slice of a Baileys socket the manager uses (a fake satisfies it in tests). */
 export interface ManagedSocket extends WaSocketLike {
@@ -47,6 +47,10 @@ interface Live {
   closing: boolean;
   attempts: number;
   connected?: boolean;
+  /** When this socket last opened, so a group scan waits for WhatsApp to settle. */
+  connectedAt?: number;
+  /** A group scan is running for this user. */
+  scanning?: boolean;
   /** The number to pair with, until pairing succeeds. Digits only. */
   pairPhone?: string;
   /** The socket a code has already been requested on (one code per socket). */
@@ -55,6 +59,10 @@ interface Live {
 }
 
 const BACKOFF_MS = [2_000, 5_000, 15_000, 60_000];
+/** How long a socket is open before the automatic group scan. */
+export const GROUP_SCAN_SETTLE_MS = 30_000;
+/** How often accounts with group saving on are rescanned. */
+export const GROUP_RESCAN_MS = 24 * 3_600_000;
 export const backoffFor = (attempt: number): number =>
   BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)] ?? 60_000;
 
@@ -102,8 +110,14 @@ export class SessionManager {
       shard?: Shard;
       /** Called when WhatsApp ends a login the user did not end themselves. */
       onLoggedOut?: (userId: string) => void;
+      /** The clock, for tests of the daily group rescan. */
+      now?: () => number;
     } = {},
   ) {}
+
+  private now(): number {
+    return this.options.now?.() ?? Date.now();
+  }
 
   /** The user's saver, only while their WhatsApp is actually connected. */
   connectedSaver(userId: string): ContactSaver | undefined {
@@ -222,6 +236,55 @@ export class SessionManager {
     }
 
     await this.#drainQueueRequests();
+    await this.#scanGroups(intents);
+  }
+
+  /**
+   * Group scans: the ones customers asked for, and the daily rescan for
+   * accounts with group saving on.
+   *
+   * The daily rescan is what makes group saving finish: each scan queues only
+   * as many people as the day's cap has room for, so a large group is saved
+   * over several days rather than in one burst. It waits until a socket has
+   * been open a little while, because WhatsApp fills in the number behind
+   * hidden member ids shortly after connecting.
+   */
+  async #scanGroups(intents: readonly SessionIntent[]): Promise<void> {
+    const now = this.now();
+    for (const intent of intents) {
+      if (!this.ownsUser(intent.user_id)) continue;
+      const live = this.#live.get(intent.user_id);
+      const asked = Boolean(intent.groups_requested_at);
+      try {
+        const saver = this.connectedSaver(intent.user_id);
+        if (!saver || !live || live.scanning) {
+          // Nobody to scan with. A request is cleared rather than left to fire
+          // hours later, the same as the save-now button.
+          if (asked && !saver) {
+            await this.store.updateSession(intent.user_id, { groups_requested_at: null });
+          }
+          continue;
+        }
+        if (!asked) {
+          if (now - (live.connectedAt ?? now) < GROUP_SCAN_SETTLE_MS) continue;
+          const last = intent.groups_scanned_at ? Date.parse(intent.groups_scanned_at) : 0;
+          if (now - last < GROUP_RESCAN_MS) continue;
+          if (!(await this.policy.get(intent.user_id)).settings.save_groups) continue;
+        }
+        live.scanning = true;
+        try {
+          await saver.importGroups();
+        } finally {
+          live.scanning = false;
+        }
+        await this.store.updateSession(intent.user_id, {
+          groups_requested_at: null,
+          groups_scanned_at: new Date(now).toISOString(),
+        });
+      } catch (error) {
+        log.error('group scan failed', { userId: intent.user_id, error: errorMessage(error) });
+      }
+    }
   }
 
   /**
@@ -405,6 +468,7 @@ export class SessionManager {
       live.attempts = 0;
       live.pairPhone = undefined;
       live.connected = true;
+      live.connectedAt = this.now();
       const phone = userPart(sock.user?.id ?? '') || null;
       await this.store.updateSession(userId, {
         status: 'connected',

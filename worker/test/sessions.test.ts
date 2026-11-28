@@ -309,6 +309,9 @@ test('the socket surface the worker declares is only ever contact writes', () =>
     'end',
     'logout',
     'requestPairingCode',
+    // A read: the list of the user's groups and their members. It is a query
+    // to WhatsApp's servers, not a message, so nobody in the group sees it.
+    'groupFetchAllParticipating',
   ]);
 
   assert.ok(declared.size > 0, 'the interfaces should have been found');

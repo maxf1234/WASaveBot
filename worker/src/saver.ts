@@ -21,7 +21,7 @@ import { decide } from './decide.js';
 import type { Decision, Verdict } from './decide.js';
 import { describeError, log, maskName, maskPhone } from './log.js';
 import { buildName, isIgnoredChat, isLidJid, isPnJid, pnJidOf, userPart } from './naming.js';
-import type { PolicyCache, SaveEvent, Store } from './store.js';
+import type { GroupMemberRow, PolicyCache, SaveEvent, Store } from './store.js';
 
 /** The slice of a Baileys socket this module uses. */
 export interface WaSocketLike {
@@ -32,7 +32,38 @@ export interface WaSocketLike {
   ): Promise<void>;
   /** Takes a contact back out, for an opt-out. Also invisible to the other person. */
   removeContact(jid: string): Promise<void>;
+  /**
+   * Reads the groups the user is in, with their members. A query, not a
+   * message: nothing is sent into any group or to any member.
+   */
+  groupFetchAllParticipating(): Promise<Record<string, GroupInfo>>;
   signalRepository: { lidMapping: { getPNForLID(lid: string): Promise<string | null> } };
+}
+
+/** A group and its members, as Baileys returns them. */
+export interface GroupInfo {
+  id: string;
+  subject?: string | null;
+  participants: {
+    id: string;
+    lid?: string | null;
+    phoneNumber?: string | null;
+    admin?: string | null;
+    notify?: string | null;
+    name?: string | null;
+  }[];
+}
+
+export interface GroupScan {
+  groups: number;
+  /** One per person per group. */
+  members: number;
+  /** Distinct people with a readable phone number. */
+  people: number;
+  /** Distinct people WhatsApp would not give a number for. */
+  hidden: number;
+  /** Put in the save queue this time (save_groups on). */
+  queued: number;
 }
 
 /**
@@ -47,7 +78,14 @@ export interface MessageContent {
 }
 
 export interface IncomingMessage {
-  key: { remoteJid?: string | null; remoteJidAlt?: string | null; fromMe?: boolean | null };
+  key: {
+    remoteJid?: string | null;
+    remoteJidAlt?: string | null;
+    fromMe?: boolean | null;
+    /** In a group: who sent it. */
+    participant?: string | null;
+    participantAlt?: string | null;
+  };
   pushName?: string | null;
   /**
    * The message itself. Read for the trigger and the opt-out phrase, and for
@@ -339,6 +377,128 @@ export class ContactSaver {
     return queued;
   }
 
+  /** Remember a group sender's push name, for naming them if their group is imported. */
+  async #learnGroupName(message: IncomingMessage): Promise<void> {
+    const name = message.pushName?.trim();
+    if (!name) return;
+    const phone = await this.#phoneOf({
+      id: message.key.participant ?? undefined,
+      phoneNumber: message.key.participantAlt ?? undefined,
+      lid: message.key.participantAlt ?? undefined,
+    });
+    if (phone && !this.#pushNames.has(phone)) this.#pushNames.set(phone, name);
+  }
+
+  /**
+   * Read every group the user is in, record who is in them, and — when the
+   * customer has asked for it — queue them to be saved.
+   *
+   * Extraction always happens: it writes nothing to anybody's address book.
+   * Saving goes through decide() like everything else, so rules, opt-outs,
+   * the subscription and arming all apply, and it only ever queues as many
+   * as today's cap has room for. The rest stay as candidates; the next daily
+   * scan picks them up, so a big group trickles in instead of hitting
+   * WhatsApp with thousands of writes at once.
+   *
+   * Nothing is recorded in the activity log per person: a group import can
+   * be thousands of people, and the saved_contacts rows and the activity rows
+   * for actual saves are the record.
+   */
+  importGroups(): Promise<GroupScan> {
+    let result: GroupScan = { groups: 0, members: 0, people: 0, hidden: 0, queued: 0 };
+    return this.#inOrder(async () => {
+      const sock = this.getSock();
+      if (!sock) throw new Error('WhatsApp is not connected');
+      const groups = Object.values(await sock.groupFetchAllParticipating());
+
+      const rows: GroupMemberRow[] = [];
+      const people = new Map<string, { name: string | null; lid: string | null }>();
+      const hidden = new Set<string>();
+      for (const group of groups) {
+        for (const member of group.participants ?? []) {
+          const lid = isLidJid(member.lid) ? member.lid : isLidJid(member.id) ? member.id : null;
+          const phone = await this.#phoneOf({
+            id: member.id,
+            lid: lid ?? undefined,
+            phoneNumber: member.phoneNumber ?? undefined,
+          });
+          if (phone && this.#isSelf(phone)) continue;
+          const name =
+            member.notify?.trim() ||
+            member.name?.trim() ||
+            (phone ? this.#pushNames.get(phone) ?? this.#tracked.get(phone)?.pushName : null) ||
+            null;
+          rows.push({
+            group_jid: group.id,
+            group_name: group.subject ?? null,
+            phone: phone || null,
+            lid,
+            name,
+            is_admin: member.admin === 'admin' || member.admin === 'superadmin',
+          });
+          if (phone) {
+            const seen = people.get(phone);
+            people.set(phone, { name: seen?.name ?? name, lid: seen?.lid ?? lid });
+          } else if (lid) {
+            hidden.add(lid);
+          }
+        }
+      }
+      await this.store.replaceGroupMembers(this.userId, rows);
+
+      let queued = 0;
+      const { settings, rules, subscribed } = await this.policy.get(this.userId);
+      if (settings.save_groups && settings.enabled && subscribed) {
+        const today = utcDay(this.#now());
+        if (today !== this.#day) {
+          this.#day = today;
+          this.#savedToday = 0;
+        }
+        let room = settings.daily_cap - this.#savedToday - this.#jobs.filter((j) => j.kind === 'save').length;
+        for (const [phone, person] of people) {
+          if (this.#isLive(phone) || this.#isRemoved(phone) || this.#queued.has(phone)) continue;
+          const pushName = person.name ?? this.#tracked.get(phone)?.pushName ?? null;
+          if (!this.#isPending(phone)) {
+            // A candidate either way, so the dashboard's "not saved yet" list
+            // and its Save button cover group members too.
+            this.#track(phone, 'pending', { pushName, lid: person.lid });
+            await this.store.claimContact(this.userId, {
+              phone, lid: person.lid, push_name: pushName, status: 'pending',
+            });
+          }
+          if (room <= 0) continue;
+          const verdict = decide(
+            { phone, body: '' },
+            // The customer switched group saving on, so the save phrase does
+            // not apply to these people.
+            { ...settings, save_mode: 'everyone' },
+            rules,
+            { alreadyKnown: false, optedOut: false, subscribed, capped: false },
+          );
+          if (verdict.action !== 'save') continue;
+          this.#queued.add(phone);
+          this.#jobs.push({
+            kind: 'save',
+            phone,
+            update: true,
+            lid: person.lid,
+            pushName,
+            requestedName: null,
+            name: buildName(pushName, phone, settings),
+            matchedPrefix: verdict.matchedPrefix,
+            ruleId: verdict.ruleId,
+          });
+          queued += 1;
+          room -= 1;
+        }
+        void this.#run();
+      }
+
+      result = { groups: groups.length, members: rows.length, people: people.size, hidden: hidden.size, queued };
+      log.info('groups scanned', { userId: this.userId, ...result });
+    }).then(() => result);
+  }
+
   #isTracked(phone: string): boolean {
     return this.#tracked.has(phone);
   }
@@ -369,6 +529,12 @@ export class ContactSaver {
   async #onMessage(message: IncomingMessage): Promise<void> {
     if (message.key.fromMe) return;
     const remoteJid = message.key.remoteJid;
+    if (remoteJid?.endsWith('@g.us')) {
+      // A group message is never a save request, but it does carry the
+      // sender's name, which is the one thing a group's member list lacks.
+      await this.#learnGroupName(message);
+      return;
+    }
     if (!remoteJid || isIgnoredChat(remoteJid)) return;
 
     const sock = this.getSock();

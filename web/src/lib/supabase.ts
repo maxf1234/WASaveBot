@@ -31,6 +31,8 @@ export interface Settings {
   save_phrase: string;
   remove_phrase: string;
   default_policy: 'allow' | 'block';
+  /** Also save everyone in the customer's groups, within the daily cap. */
+  save_groups: boolean;
 }
 
 export interface Rule {

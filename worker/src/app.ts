@@ -181,6 +181,18 @@ export function createApp(deps: AppDeps): express.Express {
     }),
   );
 
+  // Read every group the customer is in and record its members. Intent, like
+  // the backfill: the replica that holds their socket does the reading.
+  app.post(
+    '/api/groups/scan',
+    authed(async (_req, res, user) => {
+      await requireConnected(user.id);
+      await deps.store.updateSession(user.id, { groups_requested_at: new Date().toISOString() });
+      deps.sessions.nudge?.();
+      res.json({ ok: true });
+    }),
+  );
+
   // Try one contact again. The same request as a backfill, for one person.
   app.post(
     '/api/contacts/retry',

@@ -20,6 +20,9 @@ insert into wa_auth (user_id, key, value) values
 insert into rules (user_id, kind, prefix) values
   ('00000000-0000-0000-0000-00000000000a', 'block', '234'),
   ('00000000-0000-0000-0000-00000000000b', 'block', '91');
+insert into group_members (user_id, group_jid, group_name, phone, name) values
+  ('00000000-0000-0000-0000-00000000000a', '1@g.us', 'A group', '15550000011', 'Ann'),
+  ('00000000-0000-0000-0000-00000000000b', '2@g.us', 'B group', '15550000022', 'Bob');
 insert into save_events (user_id, phone, decision) values
   ('00000000-0000-0000-0000-00000000000a', '15550000001', 'saved'),
   ('00000000-0000-0000-0000-00000000000b', '15550000002', 'saved');
@@ -108,6 +111,12 @@ begin
   update profiles set subscription_status = 'active';
   get diagnostics n = row_count;
   assert n = 0, 'A cannot make themselves a subscriber';
+  assert (select count(*) from group_members) = 1, 'A sees only own group members';
+  assert (select name from group_members) = 'Ann', 'and it is theirs';
+  update group_members set name = 'x';
+  get diagnostics n = row_count;
+  assert n = 0, 'A cannot write group members';
+  assert pg_temp.denied($q$insert into group_members (user_id, group_jid, phone) values ('00000000-0000-0000-0000-00000000000a','3@g.us','1')$q$), 'A cannot insert group members';
   update profiles set pro_granted = true;
   get diagnostics n = row_count;
   assert n = 0, 'A cannot grant themselves Pro';
@@ -128,6 +137,7 @@ select set_config('request.jwt.claim.sub', '', false);
 do $$ begin
   assert (select count(*) from profiles) = 0, 'anon sees no profiles';
   assert (select count(*) from saved_contacts) = 0, 'anon sees no contacts';
+  assert (select count(*) from group_members) = 0, 'anon sees no group members';
 end $$;
 
 reset role;

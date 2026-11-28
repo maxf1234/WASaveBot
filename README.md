@@ -152,7 +152,7 @@ is held by nobody.
 
 ## Upgrading an existing deployment
 
-`0002` to `0007` are additive. Two of them backfill existing rows so that nobody
+`0002` to `0008` are additive. Two of them backfill existing rows so that nobody
 notices the upgrade, and both were checked against a database that already had
 customers in it:
 
@@ -306,6 +306,15 @@ is refused and the worker is not.
 ### Giving someone Pro
 
 Each customer row has a **Give Pro** / **Remove Pro** button. Pro given this way works without Stripe and is stored separately from the Stripe subscription, so no webhook can undo it. It takes effect within about 15 seconds; giving Pro also reconnects a socket an expired free preview had closed. Removing it drops the customer to the free preview.
+
+## Groups
+
+The dashboard's **Groups** card scans every WhatsApp group the customer is in and records each member in `group_members`: group, name, number and whether they are a group admin. **Download group members** gives that as a CSV. Reading a group's member list is a query to WhatsApp, not a message, so nobody in the group is told; the socket allowlist test permits `groupFetchAllParticipating` for that reason.
+
+- **Names**: WhatsApp's member list has no names, so they come from what the account has already seen: the push names in the history sync, and the name on any group message a member sends. People who never posted may have no name.
+- **Hidden numbers**: in some groups and communities WhatsApp shows members only by an internal id. They are listed as hidden and never saved.
+- **Saving them** is off by default: Settings → "Also save everyone in my groups". It goes through the same rules, opt-outs, subscription and arming as everyone else, and each scan queues only as many as the day's cap has room for. The rest wait as "not saved yet", and the automatic daily rescan carries on, so a big group fills in over several days instead of thousands of writes at once.
+- With saving on, groups are scanned automatically 30 seconds after connecting and then once a day. With it off, only when the customer presses Scan.
 
 ## Behaviour worth knowing
 
